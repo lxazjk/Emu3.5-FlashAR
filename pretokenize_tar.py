@@ -5,8 +5,9 @@ import glob
 import io
 import json
 import os
+import os.path as osp
 import tarfile
-from typing import Dict
+from typing import Dict, Iterable, Iterator, Tuple
 
 import numpy as np
 import torch
@@ -16,16 +17,20 @@ from tqdm import tqdm
 
 from src.vision_tokenizer import build_vision_tokenizer
 from src.utils.input_utils import smart_resize
-from emu_nar.data.infinity_mm import extract_text_from_entry
+from emu_nar.data.infinity_mm import clean_text, extract_text_from_entry
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--input_dir", required=True)
+    p.add_argument("--input_dir", default="")
     p.add_argument("--output_dir", required=True)
     p.add_argument("--split", type=str, default="train")
+    p.add_argument("--json_path", type=str, default="")
+    p.add_argument("--image_root", type=str, default="")
+    p.add_argument("--output_prefix", type=str, default="pretokenized")
+    p.add_argument("--shard_size", type=int, default=5000)
     p.add_argument(
         "--text_source",
         type=str,
@@ -79,6 +84,38 @@ def _write_member(tar_out: tarfile.TarFile, name: str, data: bytes) -> None:
     tar_out.addfile(info, io.BytesIO(data))
 
 
+def _iter_json_samples(
+    json_path: str,
+    image_root: str,
+    rank: int,
+    world_size: int,
+) -> Iterator[Tuple[str, str, str]]:
+    with open(json_path, "r", encoding="utf-8") as f:
+        items = json.load(f)
+    if world_size > 1:
+        items = items[rank::world_size]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        prompt = clean_text(str(item.get("input_prompt") or ""))
+        output_image = item.get("output_image")
+        if not prompt or not output_image:
+            continue
+        image_path = output_image
+        if not osp.isabs(image_path):
+            image_path = osp.join(image_root, output_image)
+        stem = osp.splitext(osp.basename(output_image))[0]
+        yield stem, prompt, image_path
+
+
+def _next_output_path(out_dir: str, prefix: str, rank: int, idx: int) -> str:
+    while True:
+        out_path = osp.join(out_dir, f"{prefix}.rank{rank}.part{idx}.tar")
+        if not osp.exists(out_path):
+            return out_path
+        idx += 1
+
+
 def main():
     args = parse_args()
     rank = 0
@@ -95,17 +132,55 @@ def main():
     out_split = os.path.join(args.output_dir, args.split)
     os.makedirs(out_split, exist_ok=True)
 
-    shards = sorted(glob.glob(os.path.join(in_split, "*.tar")))
-    if not shards:
-        raise FileNotFoundError(f"No tar shards found under {in_split}")
-    if world_size > 1:
-        shards = shards[rank::world_size]
-
     vq_device = args.vq_device
     if vq_device in ("auto", "cuda"):
         vq_device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
     vq_model = build_vision_tokenizer(args.vq_type, args.vq_path, device=vq_device)
     vq_model.eval()
+
+    if args.json_path:
+        image_root = args.image_root or osp.dirname(args.json_path)
+        samples = list(_iter_json_samples(args.json_path, image_root, rank, world_size))
+        it: Iterable[Tuple[str, str, str]] = tqdm(samples, desc=f"rank {rank}") if rank == 0 else samples
+        shard_size = max(1, int(args.shard_size))
+        shard_idx = 0
+        out_count = 0
+        out = None
+        for stem, prompt, image_path in it:
+            if out is None or out_count >= shard_size:
+                if out is not None:
+                    out.close()
+                out_path = _next_output_path(out_split, args.output_prefix, rank, shard_idx)
+                out = tarfile.open(out_path, "w")
+                out_count = 0
+                shard_idx += 1
+            try:
+                image = Image.open(image_path).convert("RGB")
+                tokens = _encode_image_to_tokens(
+                    image,
+                    vq_model,
+                    args.image_area,
+                    args.grid_height,
+                    args.grid_width,
+                    args.max_height,
+                    args.max_width,
+                )
+            except Exception:
+                continue
+            buf = io.BytesIO()
+            torch.save(tokens, buf)
+            _write_member(out, f"{stem}.pt", buf.getvalue())
+            _write_member(out, f"{stem}.txt", prompt.encode("utf-8"))
+            out_count += 1
+        if out is not None:
+            out.close()
+        return
+
+    shards = sorted(glob.glob(os.path.join(in_split, "*.tar")))
+    if not shards:
+        raise FileNotFoundError(f"No tar shards found under {in_split}")
+    if world_size > 1:
+        shards = shards[rank::world_size]
 
     it = tqdm(shards, desc=f"rank {rank}") if rank == 0 else shards
     for shard in it:

@@ -28,6 +28,8 @@ from emu_nar.data.infinity_mm import (
     collate_fn,
     encode_images,
 )
+from emu_nar.data.gpt4o_image import GPT4oImageDataset
+from emu_nar.data.pretokenized import PretokShardDataset, collate_pretok
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,7 +38,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tokenizer_path", type=str, required=True)
     parser.add_argument("--vq_path", type=str, required=True)
     parser.add_argument("--vq_type", type=str, default="ibq")
-    parser.add_argument("--dataset_glob", type=str, required=True, help="Glob for Infinity-MM tar shards.")
+    parser.add_argument("--dataset_glob", type=str, default="", help="Glob for Infinity-MM tar shards.")
+    parser.add_argument("--dataset_json", type=str, default="", help="JSON list for GPT4o-Image T2I.")
+    parser.add_argument("--image_root", type=str, default="", help="Image root for dataset_json.")
+    parser.add_argument("--pretok_glob", type=str, default="", help="Glob for pretokenized .tar shards.")
     parser.add_argument(
         "--text_source",
         type=str,
@@ -280,30 +285,56 @@ def main() -> None:
 
     tokenizer = _build_text_tokenizer(args.tokenizer_path)
 
+    use_pretok = bool(args.pretok_glob)
     vq_device = device if args.vq_device == "auto" else torch.device(args.vq_device)
-    vq_model = build_vision_tokenizer(args.vq_type, args.vq_path, device=str(vq_device))
-    vq_model.eval()
-    for p in vq_model.parameters():
-        p.requires_grad = False
-    vq_dtype = next(vq_model.parameters()).dtype
+    vq_model = None
+    vq_dtype = None
+    if not use_pretok:
+        vq_model = build_vision_tokenizer(args.vq_type, args.vq_path, device=str(vq_device))
+        vq_model.eval()
+        for p in vq_model.parameters():
+            p.requires_grad = False
+        vq_dtype = next(vq_model.parameters()).dtype
 
-    shard_paths = sorted(glob.glob(args.dataset_glob))
-    if not shard_paths:
-        raise FileNotFoundError(f"No tar shards found for glob: {args.dataset_glob}")
-
-    ds = InfinityMMShardDataset(
-        shard_paths=shard_paths,
-        text_source=args.text_source,
-        rank=rank,
-        world_size=world_size,
-    )
+    if use_pretok:
+        shard_paths = sorted(glob.glob(args.pretok_glob))
+        if not shard_paths:
+            raise FileNotFoundError(f"No pretokenized tar shards for glob: {args.pretok_glob}")
+        ds = PretokShardDataset(
+            shard_paths=shard_paths,
+            rank=rank,
+            world_size=world_size,
+        )
+        data_collate = collate_pretok
+    elif args.dataset_json:
+        image_root = args.image_root or osp.dirname(args.dataset_json)
+        ds = GPT4oImageDataset(
+            json_path=args.dataset_json,
+            image_root=image_root,
+            rank=rank,
+            world_size=world_size,
+        )
+        data_collate = collate_fn
+    else:
+        if not args.dataset_glob:
+            raise ValueError("Provide --dataset_glob, --dataset_json, or --pretok_glob.")
+        shard_paths = sorted(glob.glob(args.dataset_glob))
+        if not shard_paths:
+            raise FileNotFoundError(f"No tar shards found for glob: {args.dataset_glob}")
+        ds = InfinityMMShardDataset(
+            shard_paths=shard_paths,
+            text_source=args.text_source,
+            rank=rank,
+            world_size=world_size,
+        )
+        data_collate = collate_fn
 
     loader = DataLoader(
         ds,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        collate_fn=collate_fn,
+        collate_fn=data_collate,
         worker_init_fn=partial(_seed_worker, base_seed=args.seed, rank=rank),
         pin_memory=args.pin_memory,
         persistent_workers=args.persistent_workers and args.num_workers > 0,
@@ -322,19 +353,27 @@ def main() -> None:
         last_step = None
         for step, batch in enumerate(progress):
             last_step = step
-            images = batch["images"]
-            texts = batch["texts"]
-
-            tokens, height, width = encode_images(
-                vq_model=vq_model,
-                images=images,
-                image_area=image_area,
-                image_size=args.image_size,
-                device=vq_device,
-                dtype=vq_dtype,
-                visual_token_offset=visual_token_offset,
-            )
-            input_ids = tokens.view(tokens.size(0), -1).to(device)
+            if use_pretok:
+                tokens = batch["tokens"].long()
+                texts = batch["texts"]
+                height = int(tokens.size(1))
+                width = int(tokens.size(2))
+                if visual_token_offset:
+                    tokens = tokens + visual_token_offset
+                input_ids = tokens.view(tokens.size(0), -1).to(device)
+            else:
+                images = batch["images"]
+                texts = batch["texts"]
+                tokens, height, width = encode_images(
+                    vq_model=vq_model,
+                    images=images,
+                    image_area=image_area,
+                    image_size=args.image_size,
+                    device=vq_device,
+                    dtype=vq_dtype,
+                    visual_token_offset=visual_token_offset,
+                )
+                input_ids = tokens.view(tokens.size(0), -1).to(device)
 
             text_ids = [
                 _encode_text_ids(
