@@ -1,27 +1,14 @@
 # -*- coding: utf-8 -*-
-# Copyright 2025 BAAI. and/or its affiliates.
-# SPDX-License-Identifier: Apache-2.0
+# NAR-aware interleaved generation for Emu3.5.
 
 import re
-import threading
-import time
-from typing import Generator, List, Tuple, Dict, Any, Optional
+from typing import Generator, List, Dict, Any, Optional
 
 from PIL import Image
 import numpy as np
 import torch
-from transformers import GenerationConfig
 
-from transformers.generation import LogitsProcessorList
-from .logits_processor import (
-    UnbatchedClassifierFreeGuidanceLogitsForVisualTokenWithDifferentialTopKProcessor
-)
-
-try:
-    from transformers import TextIteratorStreamer
-    _HAS_STREAMER = True
-except Exception:
-    _HAS_STREAMER = False
+from .neighbor_ar_wrapper import NeighborARWrapper
 
 
 @torch.no_grad()
@@ -33,235 +20,272 @@ def generate(
     unconditional_ids,
     full_unconditional_ids=None,
     force_same_image_size=True,
-):
-
+) -> Generator[Any, None, None]:
     if getattr(cfg, "streaming", False):
         yield from streaming_generate(
-            cfg, model, tokenizer, input_ids, unconditional_ids,
-            full_unconditional_ids=full_unconditional_ids,
-            force_same_image_size=force_same_image_size
+            cfg,
+            model,
+            tokenizer,
+            input_ids,
+            unconditional_ids,
+            force_same_image_size=force_same_image_size,
         )
     else:
         yield non_streaming_generate(
-            cfg, model, tokenizer, input_ids, unconditional_ids,
-            full_unconditional_ids, force_same_image_size
-        )
-
-
-def _build_generation_objects(
-    cfg, model, tokenizer, unconditional_ids, full_unconditional_ids, force_same_image_size
-):
-    logits_processor = LogitsProcessorList()
-    logits_processor.append(
-        build_logits_processor(
-            cfg, unconditional_ids, model, tokenizer,
-            full_unconditional_ids, force_same_image_size=force_same_image_size
-        )
-    )
-    generation_config = GenerationConfig(
-        **cfg.sampling_params,
-        pad_token_id=cfg.special_token_ids["PAD"],
-        eos_token_id=cfg.special_token_ids["EOS"],
-    )
-    return logits_processor, generation_config
-
-
-def streaming_generate(
-    cfg,
-    model,
-    tokenizer,
-    input_ids,
-    unconditional_ids,
-    full_unconditional_ids=None,
-    force_same_image_size=True,
-):
-    """
-    Text: Streamed output (multiple yields)
-    Image: Output generated immediately, alternating between text and images
-    Final: Return token ids (consistent with non-streamed version, facilitating disk writing/visualization in the upstream) 
-    """
-
-    input_ids_len = input_ids.shape[1]
-    logits_processor, generation_config = _build_generation_objects(
-        cfg, model, tokenizer, unconditional_ids, full_unconditional_ids, force_same_image_size
-    )
-
-    if not _HAS_STREAMER or tokenizer is None:
-        gen_ids = non_streaming_generate(
-            cfg, model, tokenizer, input_ids, unconditional_ids,
-            full_unconditional_ids, force_same_image_size
-        )
-        yield {"type": "final_ids", "ids": gen_ids}
-        try:
-            decoded = tokenizer.batch_decode(
-                torch.tensor(np.concatenate([input_ids.cpu(), torch.tensor([gen_ids])], axis=1))
-                if isinstance(input_ids, np.ndarray)
-                else torch.cat([input_ids, torch.tensor([gen_ids], device=input_ids.device)], dim=1),
-                skip_special_tokens=False,
-            )[0]
-            for kind, payload in multimodal_decode(decoded, tokenizer, getattr(cfg, "vision_tokenizer", None)):
-                if kind == "image" and isinstance(payload, Image.Image):
-                    yield {"type": "image", "image": payload}
-        except Exception:
-            pass
-        return
-
-    # --- Initialize streaming output ---
-    streamer = TextIteratorStreamer(
-        tokenizer,
-        skip_prompt=True,
-        skip_special_tokens=False,
-    )
-
-    out_holder: Dict[str, Any] = {}
-
-    def _worker():
-        tokens = model.generate(
+            cfg,
+            model,
+            tokenizer,
             input_ids,
-            generation_config,
-            logits_processor=logits_processor,
-            streamer=streamer,
+            unconditional_ids,
+            force_same_image_size=force_same_image_size,
         )
-        out_holder["token_ids"] = tokens
-
-    th = threading.Thread(target=_worker, daemon=True)
-    th.start()
-
-    _img_start_re = re.compile(r"(?:<\|\s*(image\s*start|imagestart|boi)\s*\|>)", re.IGNORECASE)
-    _img_end_re = re.compile(r"(?:<\|\s*(image\s*end|imageend|eoi)\s*\|>)", re.IGNORECASE)
-    _global_cot_re = re.compile(r"<\|extra_60\|>(.*?)<\|extra_61\|>", re.DOTALL)
-    _step_cot_re = re.compile(r"<\|extra_50\|>(.*?)<\|extra_51\|>", re.DOTALL)
-    _special_tok_re = re.compile(r"<\|[^|>]+\|>")
-
-    buffer = ""
-    image_mode = False
-    image_tokens = []
-    image_buffer = ""
-
-    def _emit_clean_text(txt: str):
-
-        for m in [txt]:
-            yield {"type": "text", "text": m}
 
 
-    # --- Main loop: Piece-by-piece analysis ---
-    for piece in streamer:
-        if not piece:
-            continue
-        buffer += piece
-
-        while True:
-            if image_mode:
-                mend = _img_end_re.search(buffer)
-                if mend:
-                    image_tokens.append(image_buffer + buffer[:mend.end()])
-                    buffer = buffer[mend.end():]
-                    image_mode = False
-
-                    image_token_str = "".join(image_tokens)
-
-                    try:
-                        yield {"type": "image", "image": image_token_str}
-                    except Exception:
-                        pass
-                    image_tokens = []
-                    image_buffer = ""
-                    continue
-                else:
-                    img_stable, buffer = buffer[:-256], buffer[-256:]
-                    image_buffer += img_stable
-                    try:
-                        yield {"type": "broken_image", "image": image_buffer}
-                    except Exception:
-                        pass
-
-                    break
-            else:
-                mstart = _img_start_re.search(buffer)
-                if mstart:
-                    pre = buffer[:mstart.start()]
-                    for ev in _emit_clean_text(pre):
-                        yield ev
-                    
-                    buffer = buffer[mstart.start():]
-                    image_mode = True
-                    continue
-                else:
-                    stable, buffer = buffer[:-256], buffer[-256:]
-                    if stable:
-                        for ev in _emit_clean_text(stable):
-                            yield ev
-                    break
-
-    if not image_mode and buffer:
-        for ev in _emit_clean_text(buffer):
-            yield ev
-    buffer = ""
+def _get_special_ids(cfg, tokenizer):
+    if hasattr(cfg, "special_token_ids"):
+        return cfg.special_token_ids
+    return {k: tokenizer.encode(v)[0] for k, v in cfg.special_tokens.items()}
 
 
+def _get_digit_token_ids(tokenizer) -> set[int]:
+    digits = [str(i) for i in range(10)] + ["*"]
+    ids = set()
+    for d in digits:
+        ids.add(tokenizer.encode(d, add_special_tokens=False)[0])
+    return ids
+
+
+def _sample_next_token(logits, temperature, top_k, top_p):
+    logits = logits / max(temperature, 1e-5)
+    if top_k > 0:
+        top_k = min(top_k, logits.size(-1))
+        cutoff = torch.topk(logits, top_k)[0][..., -1, None]
+        logits = torch.where(logits < cutoff, torch.full_like(logits, -float("inf")), logits)
+    if top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+        sorted_indices_to_remove = cumulative_probs > top_p
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = 0
+        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+        logits = logits.masked_fill(indices_to_remove, -float("inf"))
+    probs = torch.softmax(logits, dim=-1)
+    return torch.multinomial(probs, num_samples=1)
+
+
+def _parse_hw_from_tokens(tokenizer, hw_tokens: List[int]) -> tuple[int, int]:
+    hw_str = tokenizer.decode(hw_tokens)
+    h_str, w_str = hw_str.split("*")
+    return int(h_str), int(w_str)
+
+
+def _collect_hw_tokens(seq: List[int], boi_id: int, img_id: int) -> List[int]:
+    last_boi = len(seq) - 1 - seq[::-1].index(boi_id)
+    last_img = len(seq) - 1 - seq[::-1].index(img_id)
+    return seq[last_boi + 1 : last_img]
+
+
+def _get_nar_wrapper(cfg, model) -> NeighborARWrapper:
+    if hasattr(model, "nar_wrapper"):
+        return model.nar_wrapper
+    nar_ckpt_path = getattr(cfg, "nar_ckpt_path", "")
+    if not nar_ckpt_path:
+        raise ValueError("nar_ckpt_path is required for NAR generation.")
+
+    model_config = model.config
+    visual_token_offset = int(model_config.eoi_token_id) + 1
+    wrapper = NeighborARWrapper(
+        pretrained_backbone=model.model,
+        vocab_size=model_config.vocab_size,
+        hidden_size=model_config.hidden_size,
+        num_heads=model_config.num_attention_heads,
+        pad_token_id=-100,
+        mask_token_id=model_config.pad_token_id,
+        visual_token_offset=visual_token_offset,
+        use_vertical_block=getattr(cfg, "nar_use_vertical_block", False),
+    )
+    state = torch.load(nar_ckpt_path, map_location="cpu")
+    wrapper.load_state_dict(state, strict=True)
+    wrapper = wrapper.to(next(model.parameters()).device)
+    wrapper.eval()
+    model.nar_wrapper = wrapper
+    return wrapper
+
+
+@torch.no_grad()
 def non_streaming_generate(
     cfg,
     model,
     tokenizer,
     input_ids,
     unconditional_ids,
-    full_unconditional_ids=None,
     force_same_image_size=True,
 ):
-    input_ids_len = input_ids.shape[1]
-    logits_processor = LogitsProcessorList()
-    logits_processor.append(
-        build_logits_processor(
-            cfg,
-            unconditional_ids,
-            model,
-            tokenizer,
-            full_unconditional_ids,
-            force_same_image_size=force_same_image_size,
+    special = _get_special_ids(cfg, tokenizer)
+    boi_id = special["BOI"]
+    img_id = special["IMG"]
+    eoi_id = special["EOI"]
+    eol_id = special["EOL"]
+    eos_id = special["EOS"]
+
+    visual_token_offset = int(model.config.eoi_token_id) + 1
+    digit_token_ids = _get_digit_token_ids(tokenizer)
+
+    max_new_tokens = cfg.sampling_params.get("max_new_tokens", 0)
+    text_top_k = cfg.sampling_params.get("text_top_k", 0)
+    text_top_p = cfg.sampling_params.get("text_top_p", 1.0)
+    text_temp = cfg.sampling_params.get("text_temperature", 1.0)
+    img_top_k = cfg.sampling_params.get("image_top_k", 0)
+    img_top_p = cfg.sampling_params.get("image_top_p", 1.0)
+    img_temp = cfg.sampling_params.get("image_temperature", 1.0)
+    do_sample = bool(cfg.sampling_params.get("do_sample", True))
+
+    cfg_scale = float(getattr(cfg, "classifier_free_guidance", 1.0))
+
+    device = input_ids.device
+    cond_ids = input_ids[0].tolist()
+    uncond_ids = unconditional_ids[0].tolist()
+    generated: List[int] = []
+
+    nar_wrapper = _get_nar_wrapper(cfg, model)
+
+    fixed_hw = None
+    while max_new_tokens <= 0 or len(generated) < max_new_tokens:
+        cond_tensor = torch.tensor([cond_ids], device=device, dtype=torch.long)
+        logits = model(input_ids=cond_tensor, use_cache=False).logits[:, -1, :]
+        logits[:, visual_token_offset:] = float("-inf")
+        if do_sample:
+            next_id = _sample_next_token(logits, text_temp, text_top_k, text_top_p)
+            next_id = int(next_id.item())
+        else:
+            next_id = int(logits.argmax(dim=-1).item())
+        cond_ids.append(next_id)
+        uncond_ids.append(next_id)
+        generated.append(next_id)
+
+        if next_id == eos_id:
+            break
+
+        if next_id != boi_id:
+            continue
+
+        # Generate size tokens and IMG token autoregressively.
+        size_tokens: List[int] = []
+        if force_same_image_size and fixed_hw is not None:
+            h_fix, w_fix = fixed_hw
+            size_tokens = tokenizer.encode(f"{h_fix}*{w_fix}", add_special_tokens=False)
+            for tok in size_tokens:
+                cond_ids.append(tok)
+                uncond_ids.append(tok)
+                generated.append(tok)
+            cond_ids.append(img_id)
+            uncond_ids.append(img_id)
+            generated.append(img_id)
+        else:
+            while True:
+                cond_tensor = torch.tensor([cond_ids], device=device, dtype=torch.long)
+                logits = model(input_ids=cond_tensor, use_cache=False).logits[:, -1, :]
+                allowed_mask = torch.full_like(logits, float("-inf"))
+                for tid in digit_token_ids:
+                    allowed_mask[:, tid] = 0.0
+                allowed_mask[:, img_id] = 0.0
+                logits = logits + allowed_mask
+                if do_sample:
+                    next_id = _sample_next_token(logits, text_temp, text_top_k, text_top_p)
+                    next_id = int(next_id.item())
+                else:
+                    next_id = int(logits.argmax(dim=-1).item())
+                cond_ids.append(next_id)
+                uncond_ids.append(next_id)
+                generated.append(next_id)
+                if next_id == img_id:
+                    break
+                size_tokens.append(next_id)
+                if len(size_tokens) > 16:
+                    cond_ids.append(img_id)
+                    uncond_ids.append(img_id)
+                    generated.append(img_id)
+                    break
+
+        # Parse height/width for NAR grid.
+        try:
+            if not size_tokens:
+                size_tokens = _collect_hw_tokens(cond_ids, boi_id, img_id)
+            height, width = _parse_hw_from_tokens(tokenizer, size_tokens)
+        except Exception:
+            tgt_h = getattr(cfg, "target_height", None)
+            tgt_w = getattr(cfg, "target_width", None)
+            if tgt_h is None or tgt_w is None:
+                raise
+            height, width = int(tgt_h), int(tgt_w)
+        if force_same_image_size and fixed_hw is None:
+            fixed_hw = (height, width)
+
+        # NAR decode for visual tokens.
+        prefix_ids = torch.tensor([cond_ids], device=device, dtype=torch.long)
+        uncond_prefix = torch.tensor([uncond_ids], device=device, dtype=torch.long)
+        grid = nar_wrapper.generate(
+            height=height,
+            width=width,
+            device=device,
+            text_input_ids=prefix_ids,
+            unconditional_text_input_ids=uncond_prefix,
+            cfg_scale=cfg_scale,
+            temperature=img_temp,
+            top_k=img_top_k,
+            top_p=img_top_p,
+            sample_logits=do_sample,
         )
-    )
-    generation_config = GenerationConfig(
-        **cfg.sampling_params,
-        pad_token_id=cfg.special_token_ids["PAD"],
-        eos_token_id=cfg.special_token_ids["EOS"],
-    )
-    token_ids = model.generate(
-        input_ids,
-        generation_config,
-        logits_processor=logits_processor,
-    )
-    gen_token_ids = token_ids[:, input_ids_len:]
-    return gen_token_ids[0].detach().cpu().numpy()
+
+        # Append visual tokens + row separators + EOI.
+        for r in range(height):
+            for c in range(width):
+                tok = int(grid[r, c].item())
+                cond_ids.append(tok)
+                uncond_ids.append(tok)
+                generated.append(tok)
+            if r < height - 1:
+                cond_ids.append(eol_id)
+                uncond_ids.append(eol_id)
+                generated.append(eol_id)
+        cond_ids.append(eoi_id)
+        uncond_ids.append(eoi_id)
+        generated.append(eoi_id)
+
+    return np.array(generated, dtype=np.int64)
 
 
-def build_logits_processor(
+@torch.no_grad()
+def streaming_generate(
     cfg,
-    unconditional_ids,
     model,
     tokenizer,
-    full_unconditional_ids=None,
+    input_ids,
+    unconditional_ids,
     force_same_image_size=True,
 ):
-    logits_processor = UnbatchedClassifierFreeGuidanceLogitsForVisualTokenWithDifferentialTopKProcessor(
-        guidance_scale=cfg.classifier_free_guidance,
-        unconditional_ids=unconditional_ids,
-        full_unconditional_ids=full_unconditional_ids,
-        model=model,
-        tokenizer=tokenizer,
-        unconditional_type=cfg.unconditional_type,
-        target_height=getattr(cfg, "target_height", None),
-        target_width=getattr(cfg, "target_width", None),
-        image_cfg_scale=getattr(cfg, "image_cfg_scale", 1.0),
-        use_differential_sampling=cfg.sampling_params["use_differential_sampling"],
-        text_top_k=cfg.sampling_params["text_top_k"],
-        text_top_p=cfg.sampling_params["text_top_p"],
-        text_temperature=cfg.sampling_params["text_temperature"],
-        image_top_k=cfg.sampling_params["image_top_k"],
-        image_top_p=cfg.sampling_params["image_top_p"],
-        image_temperature=cfg.sampling_params["image_temperature"],
+    gen_ids = non_streaming_generate(
+        cfg,
+        model,
+        tokenizer,
+        input_ids,
+        unconditional_ids,
         force_same_image_size=force_same_image_size,
     )
-    return logits_processor
+    full_ids = torch.cat([input_ids, torch.tensor([gen_ids], device=input_ids.device)], dim=1)
+    decoded = tokenizer.batch_decode(full_ids, skip_special_tokens=False)[0]
+    pattern = re.compile(
+        rf"({re.escape(tokenizer.boi_token)}.*?{re.escape(tokenizer.eoi_token)})",
+        re.DOTALL,
+    )
+    chunks = re.split(pattern, decoded)
+    for c in chunks:
+        if not c or not c.strip():
+            continue
+        if tokenizer.boi_token in c and tokenizer.eoi_token in c:
+            yield {"type": "image", "image": c}
+        else:
+            yield {"type": "text", "text": c}
 
 
 @torch.no_grad()
@@ -294,7 +318,6 @@ def multimodal_decode(
             multimodal_output.append(
                 ("image_cot", c.replace(tokenizer.boc_token, "").replace(tokenizer.eoc_token, ""))
             )
-        # exclude incomplete image
         elif tokenizer.boi_token not in c and len(c.strip()) > 0:
             multimodal_output.append(("text", c))
     return multimodal_output

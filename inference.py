@@ -145,6 +145,7 @@ def main():
         vq_type=cfg.vq_type,
         model_device=hf_device,
         vq_device=vq_device,
+        nar_ckpt_path=getattr(cfg, "nar_ckpt_path", ""),
         **getattr(cfg, "diffusion_decoder_kwargs", {}),
     )
     print(f"[INFO] Model loaded successfully")

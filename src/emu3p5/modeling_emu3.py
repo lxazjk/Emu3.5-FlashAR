@@ -1033,7 +1033,13 @@ class Emu3Model(Emu3PreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        if self._use_flash_attention_2:
+        if attention_mask is not None and attention_mask.dim() == 4:
+            # User-provided 4D mask (e.g. Neighbor-AR step mask). This requires eager attention.
+            if self._use_flash_attention_2 or self._use_sdpa:
+                raise ValueError("4D attention_mask requires attn_implementation='eager'.")
+            # Use the mask as-is: shape [batch, 1, seq, seq].
+            attention_mask = attention_mask
+        elif self._use_flash_attention_2:
             # 2d mask is passed through the layers
             attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
         elif self._use_sdpa and not output_attentions:

@@ -30,13 +30,16 @@ def build_emu3p5(
         model_path,
         trust_remote_code=True,
     )
+    nar_ckpt_path = kwargs.pop("nar_ckpt_path", "")
+    nar_enabled = bool(nar_ckpt_path)
+    attn_impl = "eager" if nar_enabled else "flash_attention_2"
     model = Emu3ForCausalLM.from_pretrained(
         model_path,
         config=model_config,
         torch_dtype=torch.bfloat16,
         device_map=device_map,
-        attn_implementation="flash_attention_2",
-        # attn_implementation="eager", # if you cann't install flash_attention
+        attn_implementation=attn_impl,
+        # attn_implementation=\"eager\", # if you cann't install flash_attention
     )
     model.eval()
     

@@ -69,6 +69,7 @@ class ModelRuntime:
             vq_type=getattr(cfg, "vq_type", "ibq"),
             model_device=getattr(cfg, "hf_device", device),
             vq_device=getattr(cfg, "vq_device", device),
+            nar_ckpt_path=getattr(cfg, "nar_ckpt_path", ""),
             **getattr(cfg, "diffusion_decoder_kwargs", {}),
         )
 

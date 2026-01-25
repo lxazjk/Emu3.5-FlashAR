@@ -7,6 +7,8 @@ cfg_name = Path(__file__).stem
 
 model_path = "BAAI/Emu3.5-Image" # download from hf
 vq_path = "BAAI/Emu3.5-VisionTokenizer" # download from hf
+nar_ckpt_path = ""  # NAR head checkpoint path (required for NAR decoding)
+nar_use_vertical_block = False
 
 tokenizer_path = "path_to_tokenizer"
 vq_type = "ibq"
