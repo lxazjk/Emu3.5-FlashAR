@@ -94,6 +94,7 @@ def _get_nar_wrapper(cfg, model) -> NeighborARWrapper:
 
     model_config = model.config
     visual_token_offset = int(model_config.eoi_token_id) + 1
+    vertical_layers = getattr(cfg, "nar_vertical_layers", getattr(model_config, "nar_vertical_layers", 1))
     wrapper = NeighborARWrapper(
         pretrained_backbone=model.model,
         vocab_size=model_config.vocab_size,
@@ -106,6 +107,8 @@ def _get_nar_wrapper(cfg, model) -> NeighborARWrapper:
         eol_token_id=model_config.eol_token_id,
         eoi_token_id=model_config.eoi_token_id,
         use_vertical_block=getattr(cfg, "nar_use_vertical_block", False),
+        vertical_layers=vertical_layers,
+        lm_head=model.lm_head,
     )
     state = torch.load(nar_ckpt_path, map_location="cpu")
     wrapper.load_state_dict(state, strict=True)
