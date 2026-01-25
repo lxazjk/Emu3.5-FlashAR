@@ -78,6 +78,8 @@ class NeighborARWrapper(nn.Module):
         mask_token_id: Optional[int] = None,
         visual_token_offset: Optional[int] = None,
         use_vertical_block: bool = True,
+        vertical_layers: int = 1,
+        lm_head: Optional[nn.Linear] = None,
         img_token_id: Optional[int] = None,
         eol_token_id: Optional[int] = None,
         eoi_token_id: Optional[int] = None,
@@ -97,7 +99,8 @@ class NeighborARWrapper(nn.Module):
 
         self.horizontal_head = nn.Linear(hidden_size, vocab_size)
         if use_vertical_block:
-            self.vertical_block = nn.TransformerEncoderLayer(
+            layers = max(1, int(vertical_layers))
+            encoder_layer = nn.TransformerEncoderLayer(
                 d_model=hidden_size,
                 nhead=num_heads,
                 dim_feedforward=hidden_size * ff_mult,
@@ -105,11 +108,22 @@ class NeighborARWrapper(nn.Module):
                 batch_first=True,
                 activation="gelu",
             )
+            if layers == 1:
+                self.vertical_block = encoder_layer
+                self._vertical_uses_encoder = False
+            else:
+                self.vertical_block = nn.TransformerEncoder(encoder_layer, num_layers=layers)
+                self._vertical_uses_encoder = True
             self.vertical_norm = nn.LayerNorm(hidden_size)
         else:
             self.vertical_block = None
             self.vertical_norm = None
+            self._vertical_uses_encoder = False
         self.vertical_head = nn.Linear(hidden_size, vocab_size)
+        if lm_head is not None:
+            with torch.no_grad():
+                self.horizontal_head.weight.copy_(lm_head.weight)
+                self.vertical_head.weight.copy_(lm_head.weight)
         self._sync_dtype_with_backbone()
 
     def _sync_dtype_with_backbone(self) -> None:
@@ -159,7 +173,10 @@ class NeighborARWrapper(nn.Module):
         h_logits = self.horizontal_head(h_grid)
 
         if self.vertical_block is not None:
-            v_hidden = self.vertical_block(image_hidden, src_mask=step_mask_2d)
+            if self._vertical_uses_encoder:
+                v_hidden = self.vertical_block(image_hidden, mask=step_mask_2d)
+            else:
+                v_hidden = self.vertical_block(image_hidden, src_mask=step_mask_2d)
             v_hidden = self.vertical_norm(v_hidden)
         else:
             v_hidden = image_hidden

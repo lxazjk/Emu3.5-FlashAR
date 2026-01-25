@@ -72,6 +72,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--persistent_workers", action="store_true")
     parser.add_argument("--pin_memory", action="store_true")
     parser.add_argument("--use_vertical_block", action="store_true")
+    parser.add_argument("--vertical_layers", type=int, default=0)
     return parser.parse_args()
 
 
@@ -202,6 +203,9 @@ def main() -> None:
             f"exceeds vocab_size {model_config.vocab_size}."
         )
 
+    vertical_layers = args.vertical_layers
+    if vertical_layers <= 0:
+        vertical_layers = int(getattr(model_config, "nar_vertical_layers", 1))
     wrapper = NeighborARWrapper(
         pretrained_backbone=backbone.model,
         vocab_size=model_config.vocab_size,
@@ -214,6 +218,8 @@ def main() -> None:
         eol_token_id=model_config.eol_token_id,
         eoi_token_id=model_config.eoi_token_id,
         use_vertical_block=args.use_vertical_block,
+        vertical_layers=vertical_layers,
+        lm_head=backbone.lm_head,
     )
     if args.fsdp:
         wrapper = wrapper.to(dtype=torch_dtype)

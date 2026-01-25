@@ -3,6 +3,7 @@
 import argparse
 import glob
 import io
+import json
 import os
 import tarfile
 from typing import Dict
@@ -10,11 +11,14 @@ from typing import Dict
 import numpy as np
 import torch
 import torch.distributed as dist
-from PIL import Image
+from PIL import Image, ImageFile
 from tqdm import tqdm
 
 from src.vision_tokenizer import build_vision_tokenizer
 from src.utils.input_utils import smart_resize
+from emu_nar.data.infinity_mm import extract_text_from_entry
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 def parse_args():
@@ -22,6 +26,12 @@ def parse_args():
     p.add_argument("--input_dir", required=True)
     p.add_argument("--output_dir", required=True)
     p.add_argument("--split", type=str, default="train")
+    p.add_argument(
+        "--text_source",
+        type=str,
+        default="assistant",
+        choices=["assistant", "human", "both", "caption"],
+    )
     p.add_argument("--vq_path", required=True)
     p.add_argument("--vq_type", type=str, default="ibq")
     p.add_argument("--vq_device", type=str, default="auto")
@@ -115,10 +125,18 @@ def main():
                 fobj = tf.extractfile(member)
                 if fobj is None:
                     continue
-                if ext in (".jpg", ".jpeg", ".png"):
+                if ext in (".jpg", ".jpeg", ".png", ".webp"):
                     bucket.setdefault(stem, {})["image"] = fobj.read()
                 elif ext in (".txt", ".caption", ".caption.txt"):
                     bucket.setdefault(stem, {})["text"] = fobj.read()
+                elif ext == ".json":
+                    try:
+                        meta = json.loads(fobj.read().decode("utf-8"))
+                    except Exception:
+                        continue
+                    text = extract_text_from_entry(meta, args.text_source)
+                    if text:
+                        bucket.setdefault(stem, {})["text"] = text.encode("utf-8")
                 else:
                     continue
 
@@ -128,16 +146,20 @@ def main():
                 if "image" not in entry or "text" not in entry:
                     continue
 
-                image = Image.open(io.BytesIO(entry["image"])).convert("RGB")
-                tokens = _encode_image_to_tokens(
-                    image,
-                    vq_model,
-                    args.image_area,
-                    args.grid_height,
-                    args.grid_width,
-                    args.max_height,
-                    args.max_width,
-                )
+                try:
+                    image = Image.open(io.BytesIO(entry["image"])).convert("RGB")
+                    tokens = _encode_image_to_tokens(
+                        image,
+                        vq_model,
+                        args.image_area,
+                        args.grid_height,
+                        args.grid_width,
+                        args.max_height,
+                        args.max_width,
+                    )
+                except Exception:
+                    del bucket[stem]
+                    continue
                 buf = io.BytesIO()
                 torch.save(tokens, buf)
                 _write_member(out, f"{stem}.pt", buf.getvalue())
