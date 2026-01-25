@@ -9,7 +9,7 @@ from transformers import AutoTokenizer
 
 from src.emu3p5 import Emu3Config, Emu3ForCausalLM
 from src.vision_tokenizer import build_vision_tokenizer
-from src.utils.neighbor_ar_wrapper import NeighborARWrapper
+from emu_nar.inference.neighbor_ar_wrapper import NeighborARWrapper
 
 
 def _build_text_tokenizer(tokenizer_path: str):
@@ -88,6 +88,9 @@ def main():
         pad_token_id=-100,
         mask_token_id=cfg.pad_token_id,
         visual_token_offset=visual_token_offset,
+        img_token_id=cfg.img_token_id,
+        eol_token_id=cfg.eol_token_id,
+        eoi_token_id=cfg.eoi_token_id,
     ).to(device=device, dtype=torch_dtype)
 
     state = torch.load(args.ckpt_path, map_location="cpu")

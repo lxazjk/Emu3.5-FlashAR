@@ -102,6 +102,9 @@ def _get_nar_wrapper(cfg, model) -> NeighborARWrapper:
         pad_token_id=-100,
         mask_token_id=model_config.pad_token_id,
         visual_token_offset=visual_token_offset,
+        img_token_id=model_config.img_token_id,
+        eol_token_id=model_config.eol_token_id,
+        eoi_token_id=model_config.eoi_token_id,
         use_vertical_block=getattr(cfg, "nar_use_vertical_block", False),
     )
     state = torch.load(nar_ckpt_path, map_location="cpu")

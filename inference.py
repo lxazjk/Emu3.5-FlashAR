@@ -13,7 +13,7 @@ import torch
 from tqdm import tqdm
 
 from src.utils.model_utils import build_emu3p5
-from src.utils.generation_utils import generate, multimodal_decode
+from emu_nar.inference.generation_utils import generate, multimodal_decode
 from src.utils.painting_utils import ProtoWriter
 from src.utils.input_utils import build_image, smart_resize
 

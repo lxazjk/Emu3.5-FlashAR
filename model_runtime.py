@@ -11,7 +11,7 @@ import torch
 
 from src.utils.input_utils import build_image
 from src.utils.model_utils import build_emu3p5
-from src.utils.generation_utils import generate, multimodal_decode
+from emu_nar.inference.generation_utils import generate, multimodal_decode
 
 
 class ModelRuntime:
