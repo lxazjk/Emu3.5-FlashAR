@@ -9,7 +9,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .neighbor_ar_mask import build_neighbor_ar_mask, build_text_neighbor_ar_mask
+from .neighbor_ar_mask import build_interleaved_neighbor_ar_mask
 
 
 def _top_k_top_p_filtering(
@@ -78,6 +78,9 @@ class NeighborARWrapper(nn.Module):
         mask_token_id: Optional[int] = None,
         visual_token_offset: Optional[int] = None,
         use_vertical_block: bool = True,
+        img_token_id: Optional[int] = None,
+        eol_token_id: Optional[int] = None,
+        eoi_token_id: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.backbone = pretrained_backbone
@@ -87,6 +90,10 @@ class NeighborARWrapper(nn.Module):
         self.mask_token_id = mask_token_id if mask_token_id is not None else pad_token_id
         self.visual_token_offset = visual_token_offset
         self.use_vertical_block = use_vertical_block
+        cfg = getattr(pretrained_backbone, "config", None)
+        self.img_token_id = img_token_id if img_token_id is not None else getattr(cfg, "img_token_id", None)
+        self.eol_token_id = eol_token_id if eol_token_id is not None else getattr(cfg, "eol_token_id", None)
+        self.eoi_token_id = eoi_token_id if eoi_token_id is not None else getattr(cfg, "eoi_token_id", None)
 
         self.horizontal_head = nn.Linear(hidden_size, vocab_size)
         if use_vertical_block:
@@ -199,19 +206,24 @@ class NeighborARWrapper(nn.Module):
                 text_input_ids = text_input_ids.unsqueeze(0)
             prefix_len = text_input_ids.size(1)
             full_input_ids = torch.cat([text_input_ids, image_ids], dim=1)
-            attn_mask, step_id = build_text_neighbor_ar_mask(
+            attn_mask, step_id = build_interleaved_neighbor_ar_mask(
+                prefix_ids=text_input_ids,
                 height=int(image_ids.size(1) ** 0.5),
                 width=int(image_ids.size(1) ** 0.5),
                 batch_size=image_ids.size(0),
                 device=image_ids.device,
                 dtype=mask_dtype,
-                prefix_len=prefix_len,
+                img_token_id=self.img_token_id,
+                eoi_token_id=self.eoi_token_id,
+                eol_token_id=self.eol_token_id,
+                visual_token_offset=self.visual_token_offset,
                 text_attention_mask=None,
             )
         else:
             prefix_len = 0
             full_input_ids = image_ids
-            attn_mask, step_id = build_neighbor_ar_mask(
+            attn_mask, step_id = build_interleaved_neighbor_ar_mask(
+                prefix_ids=None,
                 height=int(image_ids.size(1) ** 0.5),
                 width=int(image_ids.size(1) ** 0.5),
                 batch_size=image_ids.size(0),
@@ -242,19 +254,24 @@ class NeighborARWrapper(nn.Module):
                 raise ValueError("text_input_ids batch size must match image batch size.")
             prefix_len = text_input_ids.size(1)
             full_input_ids = torch.cat([text_input_ids, input_ids], dim=1)
-            attn_mask, step_id = build_text_neighbor_ar_mask(
+            attn_mask, step_id = build_interleaved_neighbor_ar_mask(
+                prefix_ids=text_input_ids,
                 height=height,
                 width=width,
                 batch_size=bsz,
                 device=input_ids.device,
                 dtype=mask_dtype,
-                prefix_len=prefix_len,
+                img_token_id=self.img_token_id,
+                eoi_token_id=self.eoi_token_id,
+                eol_token_id=self.eol_token_id,
+                visual_token_offset=self.visual_token_offset,
                 text_attention_mask=text_attention_mask,
             )
         else:
             prefix_len = 0
             full_input_ids = input_ids
-            attn_mask, step_id = build_neighbor_ar_mask(
+            attn_mask, step_id = build_interleaved_neighbor_ar_mask(
+                prefix_ids=None,
                 height=height,
                 width=width,
                 batch_size=bsz,
@@ -332,18 +349,23 @@ class NeighborARWrapper(nn.Module):
             if text_input_ids.dim() == 1:
                 text_input_ids = text_input_ids.unsqueeze(0)
             prefix_len = text_input_ids.size(1)
-            attn_mask, step_id = build_text_neighbor_ar_mask(
+            attn_mask, step_id = build_interleaved_neighbor_ar_mask(
+                prefix_ids=text_input_ids,
                 height=height,
                 width=width,
                 batch_size=1,
                 device=device,
                 dtype=mask_dtype,
-                prefix_len=prefix_len,
+                img_token_id=self.img_token_id,
+                eoi_token_id=self.eoi_token_id,
+                eol_token_id=self.eol_token_id,
+                visual_token_offset=self.visual_token_offset,
                 text_attention_mask=None,
             )
         else:
             prefix_len = 0
-            attn_mask, step_id = build_neighbor_ar_mask(
+            attn_mask, step_id = build_interleaved_neighbor_ar_mask(
+                prefix_ids=None,
                 height=height,
                 width=width,
                 batch_size=1,
@@ -354,13 +376,17 @@ class NeighborARWrapper(nn.Module):
             unconditional_text_input_ids = unconditional_text_input_ids.unsqueeze(0)
         if unconditional_text_input_ids is not None:
             u_prefix_len = unconditional_text_input_ids.size(1)
-            u_attn_mask, _ = build_text_neighbor_ar_mask(
+            u_attn_mask, _ = build_interleaved_neighbor_ar_mask(
+                prefix_ids=unconditional_text_input_ids,
                 height=height,
                 width=width,
                 batch_size=1,
                 device=device,
                 dtype=mask_dtype,
-                prefix_len=u_prefix_len,
+                img_token_id=self.img_token_id,
+                eoi_token_id=self.eoi_token_id,
+                eol_token_id=self.eol_token_id,
+                visual_token_offset=self.visual_token_offset,
                 text_attention_mask=None,
             )
         else:

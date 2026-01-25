@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 from src.utils.model_utils import build_emu3p5_vllm
 from src.utils.vllm_generation_utils import generate
-from src.utils.generation_utils import multimodal_decode
+from emu_nar.inference.generation_utils import multimodal_decode
 from src.utils.painting_utils import ProtoWriter
 from src.utils.input_utils import build_image
 
