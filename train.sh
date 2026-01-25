@@ -1,0 +1,15 @@
+torchrun --standalone --nproc_per_node=8 ./emu_nar/finetune.py \
+  --model_path "./weights/Emu3.5" \
+  --tokenizer_path "./src/tokenizer_emu3_ibq" \
+  --vq_path "./weights/Emu3.5-VisionTokenizer" \
+  --dataset_glob "./dataset/Infinity-MM/stage1/merge_priority_sample_10M_1/*.tar" \
+  --text_source assistant \
+  --add_boi \
+  --vq_device cpu \
+  --fsdp --fsdp_wrap_policy transformer \
+  --batch_size 1 \
+  --image_size 256 \
+  --text_max_length 128 \
+  --grad_accum_steps 4 \
+  --num_workers 4 \
+  --pin_memory --persistent_workers --prefetch_factor 4
