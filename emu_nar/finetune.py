@@ -22,6 +22,7 @@ from transformers import AutoTokenizer
 from src.emu3p5 import Emu3Config, Emu3ForCausalLM
 from emu_nar.inference.neighbor_ar_wrapper import NeighborARWrapper
 from src.vision_tokenizer import build_vision_tokenizer
+from emu_nar.lora import apply_lora_to_backbone, iter_lora_parameters
 
 from emu_nar.data.infinity_mm import (
     InfinityMMShardDataset,
@@ -78,6 +79,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pin_memory", action="store_true")
     parser.add_argument("--use_vertical_block", action="store_true")
     parser.add_argument("--vertical_layers", type=int, default=0)
+    parser.add_argument("--lora_r", type=int, default=0)
+    parser.add_argument("--lora_alpha", type=float, default=0.0)
+    parser.add_argument("--lora_dropout", type=float, default=0.0)
+    parser.add_argument("--lora_layers", type=int, default=0)
     return parser.parse_args()
 
 
@@ -195,6 +200,17 @@ def main() -> None:
         torch_dtype=torch_dtype,
         attn_implementation="eager",
     )
+    if args.lora_r > 0 and args.lora_layers > 0:
+        lora_alpha = args.lora_alpha if args.lora_alpha > 0 else float(args.lora_r)
+        lora_count = apply_lora_to_backbone(
+            backbone,
+            num_layers=args.lora_layers,
+            r=args.lora_r,
+            alpha=lora_alpha,
+            dropout=args.lora_dropout,
+        )
+        if is_main:
+            print(f"[INFO] applied LoRA to {lora_count} linear layers.")
     if not args.fsdp:
         backbone = backbone.to(device)
 
@@ -280,8 +296,13 @@ def main() -> None:
         target = wrapper.module if args.fsdp else wrapper
         for p in target.backbone.parameters():
             p.requires_grad = False
+        if args.lora_r > 0 and args.lora_layers > 0:
+            for p in iter_lora_parameters(target.backbone):
+                p.requires_grad = True
 
-    optimizer = torch.optim.AdamW(wrapper.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(
+        (p for p in wrapper.parameters() if p.requires_grad), lr=args.lr
+    )
 
     tokenizer = _build_text_tokenizer(args.tokenizer_path)
 
