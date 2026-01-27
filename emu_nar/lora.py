@@ -77,6 +77,57 @@ def apply_lora_to_backbone(
     return count
 
 
+def _build_r_schedule(num_layers: int, r_min: int, r_max: int) -> list[int]:
+    if num_layers <= 0:
+        return []
+    if num_layers == 1:
+        return [int(r_max)]
+    rs: list[int] = []
+    for idx in range(num_layers):
+        frac = idx / (num_layers - 1)
+        r = int(round(r_min + frac * (r_max - r_min)))
+        r = max(1, min(int(r_max), r))
+        rs.append(r)
+    return rs
+
+
+def apply_progressive_lora_to_backbone(
+    backbone: nn.Module,
+    num_layers: int,
+    r_min: int,
+    r_max: int,
+    alpha_scale: float,
+    dropout: float,
+    target_modules: Sequence[str] | None = None,
+) -> int:
+    if r_min <= 0 or r_max <= 0 or num_layers <= 0:
+        return 0
+    if r_min > r_max:
+        raise ValueError("LoRA r_min must be <= r_max.")
+    layers = getattr(getattr(backbone, "model", backbone), "layers", None)
+    if layers is None:
+        raise ValueError("Backbone has no layers to apply LoRA.")
+    num_layers = min(int(num_layers), len(layers))
+    targets = target_modules or (
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    )
+    selected = list(layers)[-num_layers:]
+    rs = _build_r_schedule(len(selected), int(r_min), int(r_max))
+    count = 0
+    for layer, r in zip(selected, rs):
+        alpha = float(alpha_scale) * float(r)
+        for name in targets:
+            count += _replace_linear(layer.self_attn, name, r, alpha, dropout)
+            count += _replace_linear(layer.mlp, name, r, alpha, dropout)
+    return count
+
+
 def iter_lora_parameters(module: nn.Module) -> Iterable[nn.Parameter]:
     for sub in module.modules():
         if isinstance(sub, LoRALinear):
@@ -84,4 +135,14 @@ def iter_lora_parameters(module: nn.Module) -> Iterable[nn.Parameter]:
             yield from sub.lora_B.parameters()
 
 
-__all__ = ["LoRALinear", "apply_lora_to_backbone", "iter_lora_parameters"]
+def collect_lora_modules(module: nn.Module) -> list[nn.Module]:
+    return [m for m in module.modules() if isinstance(m, LoRALinear)]
+
+
+__all__ = [
+    "LoRALinear",
+    "apply_lora_to_backbone",
+    "apply_progressive_lora_to_backbone",
+    "iter_lora_parameters",
+    "collect_lora_modules",
+]

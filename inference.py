@@ -13,9 +13,19 @@ import torch
 from tqdm import tqdm
 
 from src.utils.model_utils import build_emu3p5
-from emu_nar.inference.generation_utils import generate, multimodal_decode
 from src.utils.painting_utils import ProtoWriter
 from src.utils.input_utils import build_image, smart_resize
+
+
+def _select_generation(cfg):
+    if getattr(cfg, "nar_ckpt_path", ""):
+        from emu_nar.inference import generation_utils as gen_utils
+        mode = "NAR"
+    else:
+        from src.utils import generation_utils as gen_utils
+        mode = "AR"
+    print(f"[INFO] Generation mode: {mode}")
+    return gen_utils.generate, gen_utils.multimodal_decode
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -30,9 +40,10 @@ def inference(
     model,
     tokenizer,
     vq_model,
+    generate_fn,
+    multimodal_decode_fn,
 ):
     save_path = cfg.save_path
-
     os.makedirs(save_path, exist_ok=True)
     os.makedirs(f"{save_path}/proto", exist_ok=True)
     proto_writer = ProtoWriter()
@@ -101,10 +112,18 @@ def inference(
         if isinstance(reference_image, list) and len(reference_image) > 1:
             force_same_image_size = False   
         
-        for result_tokens in generate(cfg, model, tokenizer, input_ids, unconditional_ids, full_unc_ids, force_same_image_size):
+        for result_tokens in generate_fn(
+            cfg,
+            model,
+            tokenizer,
+            input_ids,
+            unconditional_ids,
+            full_unc_ids,
+            force_same_image_size,
+        ):
             try:
                 result = tokenizer.decode(result_tokens, skip_special_tokens=False)
-                mm_out = multimodal_decode(result, tokenizer, vq_model)
+                mm_out = multimodal_decode_fn(result, tokenizer, vq_model)
                 proto_writer.extend(mm_out)
             except Exception as e:
                 success = False
@@ -137,6 +156,7 @@ def main():
     cfg.num_prompts = len(cfg.prompts)
 
     hf_device, vq_device = cfg.hf_device, cfg.vq_device
+    generate_fn, multimodal_decode_fn = _select_generation(cfg)
 
     model, tokenizer, vq_model = build_emu3p5(
         cfg.model_path,
@@ -160,6 +180,8 @@ def main():
         model=model,
         tokenizer=tokenizer,
         vq_model=vq_model,
+        generate_fn=generate_fn,
+        multimodal_decode_fn=multimodal_decode_fn,
     )
     print(f"[INFO] Inference finished")
 

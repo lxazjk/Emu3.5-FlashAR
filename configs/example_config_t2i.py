@@ -5,8 +5,8 @@ from pathlib import Path
 from src.utils.logging_utils import setup_logger
 cfg_name = Path(__file__).stem
 
-model_path = "BAAI/Emu3.5-Image" # download from hf
-vq_path = "BAAI/Emu3.5-VisionTokenizer" # download from hf
+model_path = "./weights/Emu3.5-Image" # download from hf
+vq_path = "./weights/Emu3.5-VisionTokenizer" # download from hf
 nar_ckpt_path = ""  # NAR head checkpoint path (required for NAR decoding)
 nar_use_vertical_block = False
 
@@ -41,7 +41,7 @@ aspect_ratios = {
     "3:4": "73*55",
     "9:16": "85*47",
     "2:3": "78*52",
-    "default": "55*73",
+    "default": "32*32",
     "auto": None,
 }
 
@@ -133,7 +133,9 @@ seed = 6666
 
 _prompts_base = [
     {
-        "prompt":"""A lively comic-style illustration depicting two humorous cartoon dogs interacting near a freshly dug backyard hole surrounded by scattered dirt, garden tools, blooming flowers, and a wooden fence background. At the upper-left side, Dog One stands nervously near the messy hole, ears down and eyes wide open with an expression of concern. Its speech bubble is an oval shape, outlined neatly with smooth, slightly rounded corners, positioned clearly above Dog One's head. Inside, clearly readable playful handwritten-style text emphasizes the dog's worried tone, saying, "You sure the humans won't notice this giant hole here?". Toward the lower-right side, Dog Two sits calmly and confidently with a cheerful, carefree expression, wagging its tail gently. Its speech bubble is rectangular with softly rounded edges, placed slightly overlapping with Dog One's speech bubble to guide the reader naturally downward diagonally across the frame. Dog Two's friendly, humorous response appears in a whimsical italicized comic font, clearly stating, "Relax! We'll just blame it on the neighbor's cat again!". Each speech bubble creats the playful and engaging backyard scene.""",
+        
+        "prompt":"""A futuristic cyberpunk city street during heavy rain at night. Neon signs in pink and cyan reflect on the wet pavement. A lone samurai with a glowing katana stands in the foreground, wearing a high-tech armored trench coat. Towering skyscrapers disappear into the mist above. Cinematic composition, dramatic lighting, ray tracing, highly detailed, photorealistic, 8k resolution, cyberpunk aesthetic, Blade Runner style, sharp focus, volumetric lighting.""",
+        # "prompt":"""A lively comic-style illustration depicting two humorous cartoon dogs interacting near a freshly dug backyard hole surrounded by scattered dirt, garden tools, blooming flowers, and a wooden fence background. At the upper-left side, Dog One stands nervously near the messy hole, ears down and eyes wide open with an expression of concern. Its speech bubble is an oval shape, outlined neatly with smooth, slightly rounded corners, positioned clearly above Dog One's head. Inside, clearly readable playful handwritten-style text emphasizes the dog's worried tone, saying, "You sure the humans won't notice this giant hole here?". Toward the lower-right side, Dog Two sits calmly and confidently with a cheerful, carefree expression, wagging its tail gently. Its speech bubble is rectangular with softly rounded edges, placed slightly overlapping with Dog One's speech bubble to guide the reader naturally downward diagonally across the frame. Dog Two's friendly, humorous response appears in a whimsical italicized comic font, clearly stating, "Relax! We'll just blame it on the neighbor's cat again!". Each speech bubble creats the playful and engaging backyard scene.""",
     },
 ]
 

@@ -63,6 +63,12 @@ def parse_args():
     p.add_argument("--cfg_scale", type=float, default=1.0)
     p.add_argument("--out", type=str, default="nar_out.png")
     p.add_argument("--visual_token_offset", type=int, default=-1)
+    p.add_argument(
+        "--use_vertical_block",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    p.add_argument("--vertical_layers", type=int, default=1)
     return p.parse_args()
 
 
@@ -91,6 +97,8 @@ def main():
         img_token_id=cfg.img_token_id,
         eol_token_id=cfg.eol_token_id,
         eoi_token_id=cfg.eoi_token_id,
+        use_vertical_block=args.use_vertical_block,
+        vertical_layers=args.vertical_layers,
     ).to(device=device, dtype=torch_dtype)
 
     state = torch.load(args.ckpt_path, map_location="cpu")
