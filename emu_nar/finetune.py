@@ -20,9 +20,9 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from src.emu3p5 import Emu3Config, Emu3ForCausalLM
-from emu_nar.inference.neighbor_ar_wrapper import NeighborARWrapper
+from emu_nar.inference.neighbor_ar_wrapper import NeighborARWrapper, _sample_logits
 from src.vision_tokenizer import build_vision_tokenizer
-from emu_nar.lora import apply_lora_to_backbone, iter_lora_parameters
+from emu_nar.lora import apply_lora_to_backbone, collect_lora_modules, iter_lora_parameters
 
 from emu_nar.data.infinity_mm import (
     InfinityMMShardDataset,
@@ -58,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--grad_clip", type=float, default=0.0)
     parser.add_argument("--grad_accum_steps", type=int, default=1)
     parser.add_argument("--device", type=str, default="cuda:0")
@@ -72,6 +72,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_dir", type=str, default="./outputs/nar_finetune")
     parser.add_argument("--save_every_steps", type=int, default=0)
     parser.add_argument("--resume_path", type=str, default="")
+    parser.add_argument(
+        "--save_full_state",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When using FSDP, save a full (merged) state dict at the end of training.",
+    )
+    parser.add_argument(
+        "--save_epoch",
+        type=str,
+        default="auto",
+        choices=["auto", "none", "sharded", "full"],
+        help="Per-epoch checkpoint mode.",
+    )
+    parser.add_argument("--eval_generate_prompt", type=str, default="")
+    parser.add_argument("--eval_generate_height", type=int, default=0)
+    parser.add_argument("--eval_generate_width", type=int, default=0)
+    parser.add_argument("--eval_generate_outdir", type=str, default="")
+    parser.add_argument("--eval_generate_decode", action="store_true")
+    parser.add_argument("--eval_generate_temperature", type=float, default=1.0)
+    parser.add_argument("--eval_generate_top_k", type=int, default=0)
+    parser.add_argument("--eval_generate_top_p", type=float, default=1.0)
+    parser.add_argument("--eval_generate_cfg_scale", type=float, default=1.0)
+    parser.add_argument("--eval_generate_sample", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--eval_generate_device", type=str, default="cuda:0")
+    parser.add_argument(
+        "--eval_generate_timing",
+        type=str,
+        default="end",
+        choices=["start", "end", "both", "none"],
+    )
     parser.add_argument("--visual_token_offset", type=int, default=-1)
     parser.add_argument("--visual_vocab_size", type=int, default=131072)
     parser.add_argument("--prefetch_factor", type=int, default=2)
@@ -79,6 +109,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pin_memory", action="store_true")
     parser.add_argument("--use_vertical_block", action="store_true")
     parser.add_argument("--vertical_layers", type=int, default=0)
+    parser.add_argument("--gradient_checkpointing", action="store_true")
+    parser.add_argument(
+        "--chunked_loss",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Compute loss in row chunks to save memory (slower).",
+    )
     parser.add_argument("--lora_r", type=int, default=0)
     parser.add_argument("--lora_alpha", type=float, default=0.0)
     parser.add_argument("--lora_dropout", type=float, default=0.0)
@@ -158,6 +195,21 @@ def _safe_torch_load(path: str) -> Dict[str, Any]:
         return torch.load(path, map_location="cpu")
 
 
+def _detect_fsdp_state_type(path: str, state_dict: Dict[str, Any]) -> str:
+    if path.endswith(".full.pt"):
+        return "full"
+    for key in state_dict.keys():
+        if "flat_param" in key or "_flat_param" in key:
+            return "local"
+    for val in state_dict.values():
+        name = type(val).__name__
+        if name in ("ShardedTensor", "DTensor"):
+            return "sharded"
+        if hasattr(val, "_local_shards") or hasattr(val, "_metadata"):
+            return "sharded"
+    return "full"
+
+
 def _seed_worker(worker_id: int, base_seed: int, rank: int) -> None:
     seed = base_seed + worker_id + rank * 1000
     random.seed(seed)
@@ -200,6 +252,9 @@ def main() -> None:
         torch_dtype=torch_dtype,
         attn_implementation="eager",
     )
+    if args.gradient_checkpointing:
+        backbone.gradient_checkpointing_enable()
+        backbone.config.use_cache = False
     if args.lora_r > 0 and args.lora_layers > 0:
         lora_alpha = args.lora_alpha if args.lora_alpha > 0 else float(args.lora_r)
         lora_count = apply_lora_to_backbone(
@@ -259,17 +314,33 @@ def main() -> None:
         else:
             auto_wrap_policy = partial(size_based_auto_wrap_policy, min_num_params=args.fsdp_min_params)
         cpu_offload = CPUOffload(offload_params=True) if args.fsdp_cpu_offload else None
-        wrapper = FSDP(
-            wrapper,
+        lora_enabled = args.lora_r > 0 and args.lora_layers > 0
+        ignored_modules = collect_lora_modules(wrapper) if lora_enabled else None
+        fsdp_kwargs = dict(
             auto_wrap_policy=auto_wrap_policy,
             cpu_offload=cpu_offload,
             device_id=device,
+            use_orig_params=False,
         )
+        if ignored_modules:
+            import inspect
+
+            if "ignored_modules" in inspect.signature(FSDP).parameters:
+                fsdp_kwargs["ignored_modules"] = ignored_modules
+        wrapper = FSDP(wrapper, **fsdp_kwargs)
+        if ignored_modules:
+            for mod in ignored_modules:
+                mod.to(device=device, dtype=torch_dtype)
 
     if args.resume_path:
         if args.fsdp:
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            from torch.distributed.fsdp import ShardedStateDictConfig, StateDictType
+            from torch.distributed.fsdp import (
+                FullStateDictConfig,
+                LocalStateDictConfig,
+                ShardedStateDictConfig,
+                StateDictType,
+            )
 
             resume_path = args.resume_path
             rank_path = resume_path
@@ -279,12 +350,27 @@ def main() -> None:
                     rank_path = candidate
             if not os.path.exists(rank_path):
                 raise FileNotFoundError(f"Missing sharded checkpoint for rank {rank}: {rank_path}")
-            state_cfg = ShardedStateDictConfig(offload_to_cpu=True)
-            with FSDP.state_dict_type(wrapper, StateDictType.SHARDED_STATE_DICT, state_cfg):
-                state_dict = _safe_torch_load(rank_path)
-                wrapper.load_state_dict(state_dict, strict=True)
-            if rank == 0:
-                print("[INFO] loaded sharded ckpt:", resume_path)
+            state_dict = _safe_torch_load(rank_path)
+            state_type = _detect_fsdp_state_type(rank_path, state_dict)
+            if state_type == "sharded":
+                state_cfg = ShardedStateDictConfig(offload_to_cpu=True)
+                with FSDP.state_dict_type(wrapper, StateDictType.SHARDED_STATE_DICT, state_cfg):
+                    wrapper.load_state_dict(state_dict, strict=True)
+                if rank == 0:
+                    print("[INFO] loaded sharded ckpt:", resume_path)
+            elif state_type == "local":
+                state_cfg = LocalStateDictConfig(offload_to_cpu=True)
+                with FSDP.state_dict_type(wrapper, StateDictType.LOCAL_STATE_DICT, state_cfg):
+                    wrapper.load_state_dict(state_dict, strict=True)
+                if rank == 0:
+                    print("[INFO] loaded local ckpt:", resume_path)
+            else:
+                # Full state dict needs to be loaded on all ranks for FSDP.
+                state_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
+                with FSDP.state_dict_type(wrapper, StateDictType.FULL_STATE_DICT, state_cfg):
+                    wrapper.load_state_dict(state_dict, strict=True)
+                if rank == 0:
+                    print("[INFO] loaded full ckpt:", resume_path)
             dist.barrier()
         else:
             state_dict = _safe_torch_load(args.resume_path)
@@ -300,9 +386,9 @@ def main() -> None:
             for p in iter_lora_parameters(target.backbone):
                 p.requires_grad = True
 
-    optimizer = torch.optim.AdamW(
-        (p for p in wrapper.parameters() if p.requires_grad), lr=args.lr
-    )
+    trainable_params = [p for p in wrapper.parameters() if p.requires_grad and p.numel() > 0]
+    use_foreach = not (args.fsdp and args.lora_r > 0 and args.lora_layers > 0)
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, foreach=use_foreach)
 
     tokenizer = _build_text_tokenizer(args.tokenizer_path)
 
@@ -362,17 +448,167 @@ def main() -> None:
         prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
     )
 
+    save_epoch_mode = args.save_epoch
+    if save_epoch_mode == "auto":
+        save_epoch_mode = "sharded" if args.fsdp else "full"
+
     wrapper.train()
     global_step = 0
     accum_steps = max(1, args.grad_accum_steps)
     image_area = args.image_area or int(getattr(model_config, "image_area", 512 * 512))
-    for epoch in range(args.epochs):
+
+    def _run_epoch_generate(epoch: int) -> None:
+        if not args.eval_generate_prompt:
+            return
+        if not args.fsdp:
+            raise ValueError("eval_generate requires --fsdp for multi-GPU generation.")
+        height = int(args.eval_generate_height)
+        width = int(args.eval_generate_width)
+        if height <= 0 or width <= 0:
+            if is_main:
+                print("[WARN] eval_generate_height/width must be set to enable generation.")
+            return
+        out_dir = args.eval_generate_outdir or args.save_dir
         if is_main:
-            progress = tqdm(loader, desc=f"epoch {epoch}")
+            os.makedirs(out_dir, exist_ok=True)
+
+        def _save_outputs(grid: torch.Tensor) -> None:
+            if not is_main:
+                return
+            grid_cpu = grid.detach().cpu()
+            torch.save(grid_cpu, os.path.join(out_dir, f"gen_epoch{epoch}.pt"))
+            if not args.eval_generate_decode:
+                return
+            nonlocal vq_model, vq_dtype
+            if vq_model is None or str(next(vq_model.parameters()).device) != str(device):
+                vq_model = build_vision_tokenizer(args.vq_type, args.vq_path, device=str(device))
+                vq_model.eval()
+                for p in vq_model.parameters():
+                    p.requires_grad = False
+                vq_dtype = next(vq_model.parameters()).dtype
+            codes = grid_cpu - visual_token_offset
+            codes = codes.to(device=next(vq_model.parameters()).device, dtype=torch.long)
+            with torch.no_grad():
+                image = vq_model.decode_code(codes[None], shape=(1, height, width, 256)).float()
+            image = image[0].permute(1, 2, 0)
+            try:
+                from PIL import Image
+                import numpy as np
+
+                img = Image.fromarray(
+                    ((image + 1.0) * 127.5).clamp(0, 255).cpu().numpy().astype(np.uint8)
+                )
+                img.save(os.path.join(out_dir, f"gen_epoch{epoch}.png"))
+            except Exception as exc:
+                print(f"[WARN] decode image failed: {exc}")
+
+        was_training = wrapper.training
+        wrapper.eval()
+
+        prompt_ids = _encode_text_ids(
+            tokenizer=tokenizer,
+            text_template=args.text_template,
+            text=args.eval_generate_prompt,
+            text_max_length=args.text_max_length,
+            add_boi=args.add_boi,
+            height=height,
+            width=width,
+        ).to(device)
+        if prompt_ids.dim() == 1:
+            prompt_ids = prompt_ids.unsqueeze(0)
+        prompt_attention = torch.ones(
+            (prompt_ids.size(0), prompt_ids.size(1)), dtype=torch.long, device=device
+        )
+
+        mask_token_id = wrapper.module.mask_token_id
+        grid = torch.full((1, height, width), mask_token_id, device=device, dtype=torch.long)
+        rows = torch.arange(height, device=device).unsqueeze(1).expand(height, width)
+        cols = torch.arange(width, device=device).unsqueeze(0).expand(height, width)
+        step_id = (rows + cols).reshape(-1)
+        max_step = int(step_id.max().item())
+
+        prev_fastpath = None
+        if hasattr(torch.backends, "mha"):
+            prev_fastpath = torch.backends.mha.get_fastpath_enabled()
+            torch.backends.mha.set_fastpath_enabled(False)
+        sdp_ctx = nullcontext()
+        if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "sdp_kernel"):
+            sdp_ctx = torch.backends.cuda.sdp_kernel(
+                enable_flash=False, enable_mem_efficient=False, enable_math=True
+            )
+        with sdp_ctx, torch.no_grad():
+            for step in range(0, max_step + 1):
+                positions = (step_id == step).nonzero(as_tuple=False).view(-1)
+                if positions.numel() == 0:
+                    continue
+                image_ids = grid.view(1, -1)
+                prev_positions = positions if step == 0 else (step_id == (step - 1)).nonzero(
+                    as_tuple=False
+                ).view(-1)
+                positions = positions.to(device=device, dtype=torch.long)
+                prev_positions = prev_positions.to(device=device, dtype=torch.long)
+                outputs = wrapper(
+                    input_ids=image_ids,
+                    height=height,
+                    width=width,
+                    text_input_ids=prompt_ids,
+                    text_attention_mask=prompt_attention,
+                    step_positions=positions,
+                    prev_positions=prev_positions,
+                )
+                step_logits = outputs["step_logits"]
+                if visual_token_offset:
+                    step_logits = step_logits.clone()
+                    step_logits[:, :, :visual_token_offset] = float("-inf")
+                if rank == 0:
+                    step_pred = _sample_logits(
+                        step_logits,
+                        temperature=args.eval_generate_temperature,
+                        top_k=args.eval_generate_top_k,
+                        top_p=args.eval_generate_top_p,
+                        sample_logits=args.eval_generate_sample,
+                    )
+                else:
+                    step_pred = torch.zeros(
+                        (1, positions.numel()), device=device, dtype=torch.long
+                    )
+                dist.broadcast(step_pred, src=0)
+                grid.view(1, -1)[:, positions] = step_pred
+
+        if prev_fastpath is not None:
+            torch.backends.mha.set_fastpath_enabled(prev_fastpath)
+        _save_outputs(grid)
+        dist.barrier()
+        if was_training:
+            wrapper.train()
+    for epoch in range(args.epochs):
+        if args.eval_generate_timing in ("start", "both"):
+            _run_epoch_generate(epoch)
+        if is_main:
+            progress = tqdm(desc=f"epoch {epoch}")
         else:
-            progress = loader
+            progress = None
+        data_iter = iter(loader)
         last_step = None
-        for step, batch in enumerate(progress):
+        step = 0
+        while True:
+            has_batch = True
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                has_batch = False
+                batch = None
+
+            if args.fsdp and world_size > 1:
+                flag = torch.tensor([1 if has_batch else 0], device=device)
+                dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+                if flag.item() == 0:
+                    if is_main:
+                        print("[WARN] some rank ran out of data; stopping epoch early.")
+                    break
+            elif not has_batch:
+                break
+
             last_step = step
             if use_pretok:
                 tokens = batch["tokens"].long()
@@ -425,6 +661,7 @@ def main() -> None:
                     width=width,
                     text_input_ids=text_ids,
                     text_attention_mask=text_attention_mask,
+                    chunked_loss=args.chunked_loss,
                 )
                 raw_loss = outputs["loss"]
                 loss = raw_loss / accum_steps
@@ -440,6 +677,8 @@ def main() -> None:
                 progress.set_postfix(loss=f"{raw_loss.item():.4f}")
 
             global_step += 1
+            if progress is not None:
+                progress.update(1)
             if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
                 step_path = os.path.join(args.save_dir, f"nar_step{global_step}.pt")
                 if args.fsdp:
@@ -458,28 +697,68 @@ def main() -> None:
                         torch.save(wrapper.state_dict(), step_path)
                         print("[INFO] saved step:", step_path)
 
+            step += 1
+
+        if progress is not None:
+            progress.close()
+
         if accum_steps > 1 and last_step is not None and (last_step + 1) % accum_steps != 0:
-            if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(wrapper.parameters(), args.grad_clip)
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+            if args.fsdp:
+                if is_main:
+                    print(
+                        "[WARN] Dropping last incomplete grad accumulation for FSDP; "
+                        "set grad_accum_steps=1 or make epoch length divisible to avoid this."
+                    )
+                optimizer.zero_grad(set_to_none=True)
+            else:
+                if args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(wrapper.parameters(), args.grad_clip)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
         save_path = os.path.join(args.save_dir, f"nar_epoch{epoch}.pt")
-        if args.fsdp:
-            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            from torch.distributed.fsdp import ShardedStateDictConfig, StateDictType
+        if save_epoch_mode != "none":
+            if args.fsdp:
+                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+                from torch.distributed.fsdp import FullStateDictConfig, ShardedStateDictConfig, StateDictType
 
-            state_cfg = ShardedStateDictConfig(offload_to_cpu=True)
-            with FSDP.state_dict_type(wrapper, StateDictType.SHARDED_STATE_DICT, state_cfg):
-                state_dict = wrapper.state_dict()
-            torch.save(state_dict, save_path + f".rank{rank}.pt")
-            if is_main:
-                print("[INFO] saved sharded:", save_path)
-            dist.barrier()
-        else:
-            if is_main:
-                torch.save(wrapper.state_dict(), save_path)
-                print("[INFO] saved:", save_path)
+                if save_epoch_mode == "full":
+                    full_path = os.path.join(args.save_dir, f"nar_epoch{epoch}.full.pt")
+                    state_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+                    with FSDP.state_dict_type(wrapper, StateDictType.FULL_STATE_DICT, state_cfg):
+                        state_dict = wrapper.state_dict()
+                    if rank == 0:
+                        torch.save(state_dict, full_path)
+                        print("[INFO] saved full:", full_path)
+                    dist.barrier()
+                else:
+                    state_cfg = ShardedStateDictConfig(offload_to_cpu=True)
+                    with FSDP.state_dict_type(wrapper, StateDictType.SHARDED_STATE_DICT, state_cfg):
+                        state_dict = wrapper.state_dict()
+                    torch.save(state_dict, save_path + f".rank{rank}.pt")
+                    if is_main:
+                        print("[INFO] saved sharded:", save_path)
+                    dist.barrier()
+            else:
+                if is_main:
+                    torch.save(wrapper.state_dict(), save_path)
+                    print("[INFO] saved:", save_path)
+
+        if args.eval_generate_timing in ("end", "both"):
+            _run_epoch_generate(epoch)
+
+    if args.fsdp and args.save_full_state:
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+
+        final_path = os.path.join(args.save_dir, "nar_final.pt")
+        state_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(wrapper, StateDictType.FULL_STATE_DICT, state_cfg):
+            state_dict = wrapper.state_dict()
+        if rank == 0:
+            torch.save(state_dict, final_path)
+            print("[INFO] saved full model:", final_path)
+        dist.barrier()
 
 
 if __name__ == "__main__":

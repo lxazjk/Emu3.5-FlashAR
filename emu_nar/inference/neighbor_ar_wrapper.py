@@ -247,7 +247,7 @@ class NeighborARWrapper(nn.Module):
                 device=image_ids.device,
                 dtype=mask_dtype,
             )
-        step_mask_2d = self._build_step_mask_2d(step_id)
+        step_mask_2d = self._build_step_mask_2d(step_id).contiguous()
         return full_input_ids, prefix_len, attn_mask, step_mask_2d
 
     def forward(
@@ -257,6 +257,9 @@ class NeighborARWrapper(nn.Module):
         width: int,
         text_input_ids: Optional[torch.Tensor] = None,
         text_attention_mask: Optional[torch.Tensor] = None,
+        step_positions: Optional[torch.Tensor] = None,
+        prev_positions: Optional[torch.Tensor] = None,
+        chunked_loss: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Compute fused NAR loss over image tokens.
@@ -299,6 +302,122 @@ class NeighborARWrapper(nn.Module):
         step_mask_2d = self._build_step_mask_2d(step_id)
         hidden = self._run_backbone(full_input_ids, attn_mask)
         image_hidden = hidden[:, prefix_len:, :] if prefix_len > 0 else hidden
+
+        if step_positions is not None and prev_positions is not None:
+            if step_positions.dim() != 1 or prev_positions.dim() != 1:
+                raise ValueError("step_positions and prev_positions must be 1D tensors.")
+            if step_positions.numel() == 0:
+                return {"step_logits": torch.empty((bsz, 0, self.vocab_size), device=input_ids.device)}
+            if self.vertical_block is not None:
+                if self._vertical_uses_encoder:
+                    v_hidden = self.vertical_block(image_hidden, mask=step_mask_2d)
+                else:
+                    v_hidden = self.vertical_block(image_hidden, src_mask=step_mask_2d)
+                v_hidden = self.vertical_norm(v_hidden)
+            else:
+                v_hidden = image_hidden
+            h_prev = self.horizontal_head(image_hidden[:, prev_positions, :])
+            v_prev = self.vertical_head(v_hidden[:, prev_positions, :])
+            total = height * width
+            pos_to_idx = torch.full(
+                (total,), -1, device=input_ids.device, dtype=torch.long
+            )
+            pos_to_idx[prev_positions] = torch.arange(
+                prev_positions.numel(), device=input_ids.device
+            )
+            rows = step_positions // width
+            cols = step_positions % width
+            step_logits = torch.empty(
+                (bsz, step_positions.numel(), self.vocab_size),
+                device=input_ids.device,
+                dtype=h_prev.dtype,
+            )
+            left_mask = cols > 0
+            up_mask = rows > 0
+            both_mask = left_mask & up_mask
+            if left_mask.any():
+                left_pos = step_positions[left_mask] - 1
+                left_idx = pos_to_idx[left_pos]
+                step_logits[:, left_mask, :] = h_prev[:, left_idx, :]
+            if up_mask.any():
+                up_pos = step_positions[up_mask] - width
+                up_idx = pos_to_idx[up_pos]
+                step_logits[:, up_mask, :] = v_prev[:, up_idx, :]
+            if both_mask.any():
+                left_pos = step_positions[both_mask] - 1
+                up_pos = step_positions[both_mask] - width
+                left_idx = pos_to_idx[left_pos]
+                up_idx = pos_to_idx[up_pos]
+                step_logits[:, both_mask, :] = (
+                    h_prev[:, left_idx, :] + v_prev[:, up_idx, :]
+                ) / 2
+            if (~left_mask & ~up_mask).any():
+                idx = pos_to_idx[step_positions[~left_mask & ~up_mask]]
+                step_logits[:, ~left_mask & ~up_mask, :] = (
+                    h_prev[:, idx, :] + v_prev[:, idx, :]
+                ) / 2
+            return {"step_logits": step_logits}
+
+        if chunked_loss:
+            target_grid = input_ids.view(bsz, height, width)
+            if self.vertical_block is not None:
+                if self._vertical_uses_encoder:
+                    v_hidden = self.vertical_block(image_hidden, mask=step_mask_2d)
+                else:
+                    v_hidden = self.vertical_block(image_hidden, src_mask=step_mask_2d)
+                v_hidden = self.vertical_norm(v_hidden)
+            else:
+                v_hidden = image_hidden
+            h_grid = image_hidden.view(bsz, height, width, -1)
+            v_grid = v_hidden.view(bsz, height, width, -1)
+            loss_sum = torch.tensor(0.0, device=input_ids.device)
+            loss_h_sum = torch.tensor(0.0, device=input_ids.device)
+            loss_v_sum = torch.tensor(0.0, device=input_ids.device)
+            v_prev = None
+            for r in range(height):
+                h_logits_row = self.horizontal_head(h_grid[:, r, :, :])
+                v_logits_row = self.vertical_head(v_grid[:, r, :, :])
+                fused_row = torch.empty_like(h_logits_row)
+                if r == 0:
+                    fused_row[:, 0, :] = (h_logits_row[:, 0, :] + v_logits_row[:, 0, :]) / 2
+                    if width > 1:
+                        fused_row[:, 1:, :] = h_logits_row[:, :-1, :]
+                else:
+                    fused_row[:, 0, :] = v_prev[:, 0, :]
+                    if width > 1:
+                        fused_row[:, 1:, :] = (h_logits_row[:, :-1, :] + v_prev[:, 1:, :]) / 2
+                loss_sum += F.cross_entropy(
+                    fused_row.reshape(-1, self.vocab_size),
+                    target_grid[:, r, :].reshape(-1),
+                    ignore_index=self.pad_token_id,
+                    reduction="sum",
+                )
+                if width > 1:
+                    loss_h_sum += F.cross_entropy(
+                        h_logits_row[:, :-1, :].reshape(-1, self.vocab_size),
+                        target_grid[:, r, 1:].reshape(-1),
+                        ignore_index=self.pad_token_id,
+                        reduction="sum",
+                    )
+                if r > 0:
+                    loss_v_sum += F.cross_entropy(
+                        v_prev.reshape(-1, self.vocab_size),
+                        target_grid[:, r, :].reshape(-1),
+                        ignore_index=self.pad_token_id,
+                        reduction="sum",
+                    )
+                v_prev = v_logits_row
+            denom = float(bsz * height * width)
+            loss = loss_sum / denom
+            if width > 1:
+                loss_h = loss_h_sum / float(bsz * height * (width - 1))
+            else:
+                loss_h = torch.tensor(0.0, device=input_ids.device, dtype=loss.dtype)
+            if height > 1:
+                loss_v = loss_v_sum / float(bsz * (height - 1) * width)
+            else:
+                loss_v = torch.tensor(0.0, device=input_ids.device, dtype=loss.dtype)
+            return {"loss": loss, "loss_h": loss_h, "loss_v": loss_v}
 
         logits = self._compute_logits(image_hidden, height, width, step_mask_2d)
         fused = logits["fused"]

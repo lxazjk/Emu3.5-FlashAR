@@ -1,7 +1,12 @@
 # -*- coding: utf-8 -*-
 # NAR-aware interleaved generation for Emu3.5.
 
+import glob
+import os
+import os.path as osp
 import re
+import subprocess
+import sys
 from typing import Generator, List, Dict, Any, Optional
 
 from PIL import Image
@@ -85,12 +90,105 @@ def _collect_hw_tokens(seq: List[int], boi_id: int, img_id: int) -> List[int]:
     return seq[last_boi + 1 : last_img]
 
 
-def _get_nar_wrapper(cfg, model) -> NeighborARWrapper:
-    if hasattr(model, "nar_wrapper"):
-        return model.nar_wrapper
+def _strip_shard_suffix(path: str) -> str:
+    match = re.match(r"^(.*)\\.rank\\d+\\.pt$", path)
+    return match.group(1) if match else path
+
+
+def _auto_merge_sharded_ckpt(cfg, base_path: str, output_path: str, world_size: int) -> None:
+    if osp.exists(output_path):
+        return
+    merge_script = osp.join(osp.dirname(__file__), "..", "merge_sharded_ckpt.py")
+    merge_script = osp.normpath(merge_script)
+    if not osp.exists(merge_script):
+        raise FileNotFoundError(f"Missing merge script: {merge_script}")
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc_per_node",
+        str(world_size),
+        merge_script,
+        "--model_path",
+        cfg.model_path,
+        "--ckpt_base",
+        base_path,
+        "--output_path",
+        output_path,
+        "--dtype",
+        getattr(cfg, "nar_merge_dtype", "bf16"),
+        "--fsdp_wrap_policy",
+        getattr(cfg, "nar_fsdp_wrap_policy", "transformer"),
+        "--fsdp_min_params",
+        str(getattr(cfg, "nar_fsdp_min_params", 1_000_000)),
+        "--vertical_layers",
+        str(getattr(cfg, "nar_vertical_layers", 1)),
+    ]
+    if getattr(cfg, "nar_use_vertical_block", False):
+        cmd.append("--use_vertical_block")
+    else:
+        cmd.append("--no-use_vertical_block")
+
+    lora_layers = int(getattr(cfg, "nar_lora_layers", 0))
+    lora_r = int(getattr(cfg, "nar_lora_r", 0))
+    if lora_layers > 0 and lora_r > 0:
+        cmd.extend(
+            [
+                "--lora_layers",
+                str(lora_layers),
+                "--lora_r",
+                str(lora_r),
+                "--lora_alpha",
+                str(getattr(cfg, "nar_lora_alpha", float(lora_r))),
+                "--lora_dropout",
+                str(getattr(cfg, "nar_lora_dropout", 0.0)),
+            ]
+        )
+
+    env = os.environ.copy()
+    print(f"[INFO] Merging sharded NAR ckpt -> {output_path}")
+    subprocess.run(cmd, check=True, env=env)
+
+
+def _resolve_nar_ckpt_path(cfg) -> str:
     nar_ckpt_path = getattr(cfg, "nar_ckpt_path", "")
     if not nar_ckpt_path:
         raise ValueError("nar_ckpt_path is required for NAR generation.")
+    nar_ckpt_path = _strip_shard_suffix(nar_ckpt_path)
+
+    if osp.exists(nar_ckpt_path):
+        return nar_ckpt_path
+
+    if nar_ckpt_path.endswith(".pt"):
+        full_candidate = nar_ckpt_path[:-3] + ".full.pt"
+    else:
+        full_candidate = nar_ckpt_path + ".full.pt"
+    if osp.exists(full_candidate):
+        return full_candidate
+
+    shard_paths = sorted(glob.glob(nar_ckpt_path + ".rank*.pt"))
+    if not shard_paths and nar_ckpt_path.endswith(".pt"):
+        base = nar_ckpt_path[:-3]
+        shard_paths = sorted(glob.glob(base + ".rank*.pt"))
+        if shard_paths:
+            nar_ckpt_path = base
+
+    if not shard_paths:
+        raise FileNotFoundError(f"NAR ckpt not found: {nar_ckpt_path}")
+
+    output_path = nar_ckpt_path + ".full.pt"
+    _auto_merge_sharded_ckpt(cfg, nar_ckpt_path, output_path, len(shard_paths))
+    if not osp.exists(output_path):
+        raise FileNotFoundError(f"Failed to merge sharded ckpt: {output_path}")
+    return output_path
+
+
+def _get_nar_wrapper(cfg, model) -> NeighborARWrapper:
+    if hasattr(model, "nar_wrapper"):
+        return model.nar_wrapper
+    nar_ckpt_path = _resolve_nar_ckpt_path(cfg)
 
     model_config = model.config
     visual_token_offset = int(model_config.eoi_token_id) + 1
