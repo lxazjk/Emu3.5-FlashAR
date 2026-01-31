@@ -22,7 +22,12 @@ from transformers import AutoTokenizer
 from src.emu3p5 import Emu3Config, Emu3ForCausalLM
 from emu_nar.inference.neighbor_ar_wrapper import NeighborARWrapper, _sample_logits
 from src.vision_tokenizer import build_vision_tokenizer
-from emu_nar.lora import apply_lora_to_backbone, collect_lora_modules, iter_lora_parameters
+from emu_nar.lora import (
+    apply_lora_to_backbone,
+    apply_progressive_lora_to_backbone,
+    collect_lora_modules,
+    iter_lora_parameters,
+)
 
 from emu_nar.data.infinity_mm import (
     InfinityMMShardDataset,
@@ -58,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--lr", type=float, default=2e-6)
     parser.add_argument("--grad_clip", type=float, default=0.0)
     parser.add_argument("--grad_accum_steps", type=int, default=1)
     parser.add_argument("--device", type=str, default="cuda:0")
@@ -117,6 +122,12 @@ def parse_args() -> argparse.Namespace:
         help="Compute loss in row chunks to save memory (slower).",
     )
     parser.add_argument("--lora_r", type=int, default=0)
+    parser.add_argument(
+        "--lora_r_min",
+        type=int,
+        default=0,
+        help="Minimum LoRA rank for progressive schedule (front layers).",
+    )
     parser.add_argument("--lora_alpha", type=float, default=0.0)
     parser.add_argument("--lora_dropout", type=float, default=0.0)
     parser.add_argument("--lora_layers", type=int, default=0)
@@ -256,14 +267,27 @@ def main() -> None:
         backbone.gradient_checkpointing_enable()
         backbone.config.use_cache = False
     if args.lora_r > 0 and args.lora_layers > 0:
-        lora_alpha = args.lora_alpha if args.lora_alpha > 0 else float(args.lora_r)
-        lora_count = apply_lora_to_backbone(
-            backbone,
-            num_layers=args.lora_layers,
-            r=args.lora_r,
-            alpha=lora_alpha,
-            dropout=args.lora_dropout,
-        )
+        if args.lora_r_min > 0:
+            alpha_scale = (args.lora_alpha if args.lora_alpha > 0 else float(args.lora_r)) / float(
+                args.lora_r
+            )
+            lora_count = apply_progressive_lora_to_backbone(
+                backbone,
+                num_layers=args.lora_layers,
+                r_min=args.lora_r_min,
+                r_max=args.lora_r,
+                alpha_scale=alpha_scale,
+                dropout=args.lora_dropout,
+            )
+        else:
+            lora_alpha = args.lora_alpha if args.lora_alpha > 0 else float(args.lora_r)
+            lora_count = apply_lora_to_backbone(
+                backbone,
+                num_layers=args.lora_layers,
+                r=args.lora_r,
+                alpha=lora_alpha,
+                dropout=args.lora_dropout,
+            )
         if is_main:
             print(f"[INFO] applied LoRA to {lora_count} linear layers.")
     if not args.fsdp:

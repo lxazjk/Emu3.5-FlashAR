@@ -10,6 +10,7 @@ from transformers import AutoTokenizer
 from src.emu3p5 import Emu3Config, Emu3ForCausalLM
 from src.vision_tokenizer import build_vision_tokenizer
 from emu_nar.inference.neighbor_ar_wrapper import NeighborARWrapper
+from emu_nar.lora import apply_lora_to_backbone, apply_progressive_lora_to_backbone
 
 
 def _build_text_tokenizer(tokenizer_path: str):
@@ -69,6 +70,11 @@ def parse_args():
         default=True,
     )
     p.add_argument("--vertical_layers", type=int, default=1)
+    p.add_argument("--lora_layers", type=int, default=0)
+    p.add_argument("--lora_r", type=int, default=0)
+    p.add_argument("--lora_r_min", type=int, default=0)
+    p.add_argument("--lora_alpha", type=float, default=0.0)
+    p.add_argument("--lora_dropout", type=float, default=0.0)
     return p.parse_args()
 
 
@@ -85,6 +91,29 @@ def main():
     backbone = Emu3ForCausalLM.from_pretrained(
         args.model_path, config=cfg, torch_dtype=torch_dtype, attn_implementation="eager"
     ).to(device)
+
+    if args.lora_r > 0 and args.lora_layers > 0:
+        if args.lora_r_min > 0:
+            alpha_scale = (args.lora_alpha if args.lora_alpha > 0 else float(args.lora_r)) / float(
+                args.lora_r
+            )
+            apply_progressive_lora_to_backbone(
+                backbone,
+                num_layers=args.lora_layers,
+                r_min=args.lora_r_min,
+                r_max=args.lora_r,
+                alpha_scale=alpha_scale,
+                dropout=args.lora_dropout,
+            )
+        else:
+            lora_alpha = args.lora_alpha if args.lora_alpha > 0 else float(args.lora_r)
+            apply_lora_to_backbone(
+                backbone,
+                num_layers=args.lora_layers,
+                r=args.lora_r,
+                alpha=lora_alpha,
+                dropout=args.lora_dropout,
+            )
 
     wrapper = NeighborARWrapper(
         pretrained_backbone=backbone.model,
@@ -113,7 +142,7 @@ def main():
         if args.add_boi and hasattr(tokenizer, "boi_token"):
             text_ids = list(text_ids) + _build_image_prefix_tokens(tokenizer, args.height, args.width)
         text_ids = torch.tensor(text_ids, dtype=torch.long, device=device).unsqueeze(0)
-
+    
     with torch.no_grad():
         tokens = wrapper.generate(
             height=args.height,
