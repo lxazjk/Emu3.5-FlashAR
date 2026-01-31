@@ -1,0 +1,13 @@
+  python generate_neighbor_ar.py \
+    --model_path ./weights/Emu3.5-Image \
+    --tokenizer_path ./src/tokenizer_emu3_ibq \
+    --vq_path ./weights/Emu3.5-VisionTokenizer \
+    --ckpt_path ./outputs/nar_finetune/nar_final.pt \
+    --height 32 --width 32 \
+    --prompt "a pig" \
+    --add_boi \
+    --use_vertical_block \
+    --vertical_layers 4 \
+      --lora_layers 32 --lora_r_min 2 --lora_r 8 --lora_alpha 12 --lora_dropout 0.05 \
+    --text_template "<|extra_203|>You are a helpful assistant for t2i task. USER: {text} ASSISTANT: <|extra_100|>" \
+    --out ./nar_out.png

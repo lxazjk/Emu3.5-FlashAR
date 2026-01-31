@@ -12,9 +12,7 @@
     --use_vertical_block \
     --vertical_layers 4 \
     --epochs 5 \
-    --lora_layers 8 \
-    --lora_r 16 \
-    --lora_alpha 32 \
+    --lora_layers 32 --lora_r_min 2 --lora_r 8 --lora_alpha 12 \
     --lora_dropout 0.05 \
     --gradient_checkpointing \
     --save_epoch full \
@@ -24,5 +22,6 @@
     --eval_generate_decode \
     --eval_generate_timing start \
     --eval_generate_outdir ./outputs/nar_finetune \
-    --resume_path ./outputs/nar_finetune/nar_epoch1.full.pt
-    # --batch_size 1 \
+    --resume_path ./outputs/nar_finetune/nar_epoch3.full.pt \
+    --prefetch_factor=4 --persistent_workers --pin_memory \
+    --grad_accum_steps 2
