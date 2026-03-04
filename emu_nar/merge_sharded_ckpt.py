@@ -10,7 +10,7 @@ import torch
 import torch.distributed as dist
 
 from src.emu3p5 import Emu3Config, Emu3ForCausalLM
-from emu_nar.inference.neighbor_ar_wrapper import NeighborARWrapper
+from emu_nar.modeling_emu_nar import EmuNAR
 from emu_nar.lora import apply_lora_to_backbone
 
 
@@ -93,7 +93,7 @@ def main() -> None:
         )
 
     visual_token_offset = int(config.eoi_token_id) + 1
-    wrapper = NeighborARWrapper(
+    wrapper = EmuNAR(
         pretrained_backbone=backbone.model,
         vocab_size=config.vocab_size,
         hidden_size=config.hidden_size,

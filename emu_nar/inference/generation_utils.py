@@ -13,7 +13,7 @@ from PIL import Image
 import numpy as np
 import torch
 
-from .neighbor_ar_wrapper import NeighborARWrapper
+from emu_nar.modeling_emu_nar import EmuNAR
 
 
 @torch.no_grad()
@@ -185,7 +185,7 @@ def _resolve_nar_ckpt_path(cfg) -> str:
     return output_path
 
 
-def _get_nar_wrapper(cfg, model) -> NeighborARWrapper:
+def _get_nar_wrapper(cfg, model) -> EmuNAR:
     if hasattr(model, "nar_wrapper"):
         return model.nar_wrapper
     nar_ckpt_path = _resolve_nar_ckpt_path(cfg)
@@ -193,7 +193,7 @@ def _get_nar_wrapper(cfg, model) -> NeighborARWrapper:
     model_config = model.config
     visual_token_offset = int(model_config.eoi_token_id) + 1
     vertical_layers = getattr(cfg, "nar_vertical_layers", getattr(model_config, "nar_vertical_layers", 1))
-    wrapper = NeighborARWrapper(
+    wrapper = EmuNAR(
         pretrained_backbone=model.model,
         vocab_size=model_config.vocab_size,
         hidden_size=model_config.hidden_size,

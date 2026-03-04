@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-# NAR fine-tuning entry for Infinity-MM webdataset shards (json + image).
 
 from __future__ import annotations
 
@@ -20,7 +19,7 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from src.emu3p5 import Emu3Config, Emu3ForCausalLM
-from emu_nar.inference.neighbor_ar_wrapper import NeighborARWrapper, _sample_logits
+from emu_nar.modeling_emu_nar import EmuNAR, _sample_logits
 from src.vision_tokenizer import build_vision_tokenizer
 from emu_nar.lora import (
     apply_lora_to_backbone,
@@ -29,12 +28,7 @@ from emu_nar.lora import (
     iter_lora_parameters,
 )
 
-from emu_nar.data.infinity_mm import (
-    InfinityMMShardDataset,
-    collate_fn,
-    encode_images,
-)
-from emu_nar.data.gpt4o_image import GPT4oImageDataset
+from emu_nar.data.gpt4o_image import GPT4oImageDataset, collate_fn, encode_images
 from emu_nar.data.pretokenized import PretokShardDataset, collate_pretok
 
 
@@ -44,16 +38,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tokenizer_path", type=str, required=True)
     parser.add_argument("--vq_path", type=str, required=True)
     parser.add_argument("--vq_type", type=str, default="ibq")
-    parser.add_argument("--dataset_glob", type=str, default="", help="Glob for Infinity-MM tar shards.")
     parser.add_argument("--dataset_json", type=str, default="", help="JSON list for GPT4o-Image T2I.")
     parser.add_argument("--image_root", type=str, default="", help="Image root for dataset_json.")
     parser.add_argument("--pretok_glob", type=str, default="", help="Glob for pretokenized .tar shards.")
-    parser.add_argument(
-        "--text_source",
-        type=str,
-        default="assistant",
-        choices=["assistant", "human", "both", "caption"],
-    )
     parser.add_argument("--text_template", type=str, default="{text}")
     parser.add_argument("--text_max_length", type=int, default=0)
     parser.add_argument("--add_boi", action="store_true")
@@ -70,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vq_device", type=str, default="auto")
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--train_backbone", action="store_true")
-    parser.add_argument("--fsdp", action="store_true")
+    parser.add_argument("--fsdp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--fsdp_min_params", type=int, default=1_000_000)
     parser.add_argument("--fsdp_wrap_policy", type=str, default="transformer", choices=["size", "transformer"])
     parser.add_argument("--fsdp_cpu_offload", action="store_true")
@@ -227,10 +214,7 @@ def _seed_worker(worker_id: int, base_seed: int, rank: int) -> None:
     np.random.seed(seed)
 
 
-def main() -> None:
-    args = parse_args()
-    random.seed(args.seed)
-
+def _setup_distributed(args: argparse.Namespace) -> Tuple[int, int, int, torch.device]:
     if args.fsdp:
         if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
             raise ValueError("FSDP requires torchrun/torch.distributed with RANK/WORLD_SIZE set.")
@@ -244,19 +228,23 @@ def main() -> None:
     else:
         rank = 0
         world_size = 1
-        device = torch.device(args.device)
         local_rank = 0
+        device = torch.device(args.device)
+    return rank, world_size, local_rank, device
 
-    is_main = rank == 0
+
+def _prepare_output_dir(args: argparse.Namespace, is_main: bool) -> None:
     if args.fsdp or is_main:
         os.makedirs(args.save_dir, exist_ok=True)
-    if is_main and args.train_backbone:
-        print("[WARN] training full backbone; consider unfreezing after NAR heads converge.")
 
-    dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
-    torch_dtype = dtype_map[args.dtype]
 
-    model_config = Emu3Config.from_pretrained(args.model_path, trust_remote_code=True)
+def _build_backbone(
+    args: argparse.Namespace,
+    model_config: Emu3Config,
+    torch_dtype: torch.dtype,
+    device: torch.device,
+    is_main: bool,
+) -> Emu3ForCausalLM:
     backbone = Emu3ForCausalLM.from_pretrained(
         args.model_path,
         config=model_config,
@@ -292,7 +280,12 @@ def main() -> None:
             print(f"[INFO] applied LoRA to {lora_count} linear layers.")
     if not args.fsdp:
         backbone = backbone.to(device)
+    return backbone
 
+
+def _resolve_visual_offset(
+    args: argparse.Namespace, model_config: Emu3Config
+) -> int:
     visual_token_offset = args.visual_token_offset
     if visual_token_offset < 0:
         visual_token_offset = int(model_config.eoi_token_id) + 1
@@ -302,11 +295,21 @@ def main() -> None:
             f"visual_token_offset {visual_token_offset} + visual_vocab_size {args.visual_vocab_size} "
             f"exceeds vocab_size {model_config.vocab_size}."
         )
+    return visual_token_offset
 
+
+def _build_wrapper(
+    args: argparse.Namespace,
+    backbone: Emu3ForCausalLM,
+    model_config: Emu3Config,
+    torch_dtype: torch.dtype,
+    device: torch.device,
+) -> Tuple[EmuNAR, int]:
+    visual_token_offset = _resolve_visual_offset(args, model_config)
     vertical_layers = args.vertical_layers
     if vertical_layers <= 0:
         vertical_layers = int(getattr(model_config, "nar_vertical_layers", 1))
-    wrapper = NeighborARWrapper(
+    wrapper = EmuNAR(
         pretrained_backbone=backbone.model,
         vocab_size=model_config.vocab_size,
         hidden_size=model_config.hidden_size,
@@ -325,109 +328,136 @@ def main() -> None:
         wrapper = wrapper.to(dtype=torch_dtype)
     else:
         wrapper = wrapper.to(device=device, dtype=torch_dtype)
+    return wrapper, visual_token_offset
 
+
+def _wrap_fsdp_if_needed(
+    args: argparse.Namespace,
+    wrapper: EmuNAR,
+    device: torch.device,
+    torch_dtype: torch.dtype,
+) -> EmuNAR:
+    if not args.fsdp:
+        return wrapper
+    from torch.distributed.fsdp import CPUOffload, FullyShardedDataParallel as FSDP
+    from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer_auto_wrap_policy
+    from src.emu3p5.modeling_emu3 import Emu3DecoderLayer
+
+    if args.fsdp_wrap_policy == "transformer":
+        auto_wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls={Emu3DecoderLayer})
+    else:
+        auto_wrap_policy = partial(size_based_auto_wrap_policy, min_num_params=args.fsdp_min_params)
+    cpu_offload = CPUOffload(offload_params=True) if args.fsdp_cpu_offload else None
+    lora_enabled = args.lora_r > 0 and args.lora_layers > 0
+    ignored_modules = collect_lora_modules(wrapper) if lora_enabled else None
+    fsdp_kwargs = dict(
+        auto_wrap_policy=auto_wrap_policy,
+        cpu_offload=cpu_offload,
+        device_id=device,
+        use_orig_params=False,
+    )
+    if ignored_modules:
+        import inspect
+
+        if "ignored_modules" in inspect.signature(FSDP).parameters:
+            fsdp_kwargs["ignored_modules"] = ignored_modules
+    wrapper = FSDP(wrapper, **fsdp_kwargs)
+    if ignored_modules:
+        for mod in ignored_modules:
+            mod.to(device=device, dtype=torch_dtype)
+    return wrapper
+
+
+def _resume_if_needed(
+    args: argparse.Namespace,
+    wrapper: EmuNAR,
+    rank: int,
+    is_main: bool,
+) -> None:
+    if not args.resume_path:
+        return
     if args.fsdp:
-        from torch.distributed.fsdp import CPUOffload, FullyShardedDataParallel as FSDP
-        from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer_auto_wrap_policy
-        from src.emu3p5.modeling_emu3 import Emu3DecoderLayer
-
-        if args.fsdp_wrap_policy == "transformer":
-            auto_wrap_policy = partial(
-                transformer_auto_wrap_policy, transformer_layer_cls={Emu3DecoderLayer}
-            )
-        else:
-            auto_wrap_policy = partial(size_based_auto_wrap_policy, min_num_params=args.fsdp_min_params)
-        cpu_offload = CPUOffload(offload_params=True) if args.fsdp_cpu_offload else None
-        lora_enabled = args.lora_r > 0 and args.lora_layers > 0
-        ignored_modules = collect_lora_modules(wrapper) if lora_enabled else None
-        fsdp_kwargs = dict(
-            auto_wrap_policy=auto_wrap_policy,
-            cpu_offload=cpu_offload,
-            device_id=device,
-            use_orig_params=False,
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import (
+            FullStateDictConfig,
+            LocalStateDictConfig,
+            ShardedStateDictConfig,
+            StateDictType,
         )
-        if ignored_modules:
-            import inspect
 
-            if "ignored_modules" in inspect.signature(FSDP).parameters:
-                fsdp_kwargs["ignored_modules"] = ignored_modules
-        wrapper = FSDP(wrapper, **fsdp_kwargs)
-        if ignored_modules:
-            for mod in ignored_modules:
-                mod.to(device=device, dtype=torch_dtype)
-
-    if args.resume_path:
-        if args.fsdp:
-            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            from torch.distributed.fsdp import (
-                FullStateDictConfig,
-                LocalStateDictConfig,
-                ShardedStateDictConfig,
-                StateDictType,
-            )
-
-            resume_path = args.resume_path
-            rank_path = resume_path
-            if not resume_path.endswith(f".rank{rank}.pt"):
-                candidate = resume_path + f".rank{rank}.pt"
-                if os.path.exists(candidate):
-                    rank_path = candidate
-            if not os.path.exists(rank_path):
-                raise FileNotFoundError(f"Missing sharded checkpoint for rank {rank}: {rank_path}")
-            state_dict = _safe_torch_load(rank_path)
-            state_type = _detect_fsdp_state_type(rank_path, state_dict)
-            if state_type == "sharded":
-                state_cfg = ShardedStateDictConfig(offload_to_cpu=True)
-                with FSDP.state_dict_type(wrapper, StateDictType.SHARDED_STATE_DICT, state_cfg):
-                    wrapper.load_state_dict(state_dict, strict=True)
-                if rank == 0:
-                    print("[INFO] loaded sharded ckpt:", resume_path)
-            elif state_type == "local":
-                state_cfg = LocalStateDictConfig(offload_to_cpu=True)
-                with FSDP.state_dict_type(wrapper, StateDictType.LOCAL_STATE_DICT, state_cfg):
-                    wrapper.load_state_dict(state_dict, strict=True)
-                if rank == 0:
-                    print("[INFO] loaded local ckpt:", resume_path)
-            else:
-                # Full state dict needs to be loaded on all ranks for FSDP.
-                state_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
-                with FSDP.state_dict_type(wrapper, StateDictType.FULL_STATE_DICT, state_cfg):
-                    wrapper.load_state_dict(state_dict, strict=True)
-                if rank == 0:
-                    print("[INFO] loaded full ckpt:", resume_path)
-            dist.barrier()
-        else:
-            state_dict = _safe_torch_load(args.resume_path)
-            wrapper.load_state_dict(state_dict, strict=True)
+        resume_path = args.resume_path
+        rank_path = resume_path
+        if not resume_path.endswith(f".rank{rank}.pt"):
+            candidate = resume_path + f".rank{rank}.pt"
+            if os.path.exists(candidate):
+                rank_path = candidate
+        if not os.path.exists(rank_path):
+            raise FileNotFoundError(f"Missing sharded checkpoint for rank {rank}: {rank_path}")
+        state_dict = _safe_torch_load(rank_path)
+        state_type = _detect_fsdp_state_type(rank_path, state_dict)
+        if state_type == "sharded":
+            state_cfg = ShardedStateDictConfig(offload_to_cpu=True)
+            with FSDP.state_dict_type(wrapper, StateDictType.SHARDED_STATE_DICT, state_cfg):
+                wrapper.load_state_dict(state_dict, strict=True)
             if rank == 0:
-                print("[INFO] loaded ckpt:", args.resume_path)
+                print("[INFO] loaded sharded ckpt:", resume_path)
+        elif state_type == "local":
+            state_cfg = LocalStateDictConfig(offload_to_cpu=True)
+            with FSDP.state_dict_type(wrapper, StateDictType.LOCAL_STATE_DICT, state_cfg):
+                wrapper.load_state_dict(state_dict, strict=True)
+            if rank == 0:
+                print("[INFO] loaded local ckpt:", resume_path)
+        else:
+            state_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
+            with FSDP.state_dict_type(wrapper, StateDictType.FULL_STATE_DICT, state_cfg):
+                wrapper.load_state_dict(state_dict, strict=True)
+            if rank == 0:
+                print("[INFO] loaded full ckpt:", resume_path)
+        dist.barrier()
+    else:
+        state_dict = _safe_torch_load(args.resume_path)
+        wrapper.load_state_dict(state_dict, strict=True)
+        if is_main:
+            print("[INFO] loaded ckpt:", args.resume_path)
 
-    if not args.train_backbone:
-        target = wrapper.module if args.fsdp else wrapper
-        for p in target.backbone.parameters():
-            p.requires_grad = False
-        if args.lora_r > 0 and args.lora_layers > 0:
-            for p in iter_lora_parameters(target.backbone):
-                p.requires_grad = True
 
+def _freeze_backbone_if_needed(args: argparse.Namespace, wrapper: EmuNAR) -> None:
+    if args.train_backbone:
+        return
+    target = wrapper.module if args.fsdp else wrapper
+    for p in target.backbone.parameters():
+        p.requires_grad = False
+    if args.lora_r > 0 and args.lora_layers > 0:
+        for p in iter_lora_parameters(target.backbone):
+            p.requires_grad = True
+
+
+def _build_optimizer(
+    args: argparse.Namespace, wrapper: EmuNAR
+) -> torch.optim.Optimizer:
     trainable_params = [p for p in wrapper.parameters() if p.requires_grad and p.numel() > 0]
     use_foreach = not (args.fsdp and args.lora_r > 0 and args.lora_layers > 0)
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, foreach=use_foreach)
+    return torch.optim.AdamW(trainable_params, lr=args.lr, foreach=use_foreach)
 
-    tokenizer = _build_text_tokenizer(args.tokenizer_path)
 
-    use_pretok = bool(args.pretok_glob)
+def _build_vq(
+    args: argparse.Namespace, use_pretok: bool, device: torch.device
+) -> Tuple[Any, Any, torch.device]:
     vq_device = device if args.vq_device == "auto" else torch.device(args.vq_device)
-    vq_model = None
-    vq_dtype = None
-    if not use_pretok:
-        vq_model = build_vision_tokenizer(args.vq_type, args.vq_path, device=str(vq_device))
-        vq_model.eval()
-        for p in vq_model.parameters():
-            p.requires_grad = False
-        vq_dtype = next(vq_model.parameters()).dtype
-
     if use_pretok:
+        return None, None, vq_device
+    vq_model = build_vision_tokenizer(args.vq_type, args.vq_path, device=str(vq_device))
+    vq_model.eval()
+    for p in vq_model.parameters():
+        p.requires_grad = False
+    vq_dtype = next(vq_model.parameters()).dtype
+    return vq_model, vq_dtype, vq_device
+
+
+def _build_dataset(
+    args: argparse.Namespace, rank: int, world_size: int
+) -> Tuple[Any, Any, bool]:
+    if args.pretok_glob:
         shard_paths = sorted(glob.glob(args.pretok_glob))
         if not shard_paths:
             raise FileNotFoundError(f"No pretokenized tar shards for glob: {args.pretok_glob}")
@@ -436,8 +466,8 @@ def main() -> None:
             rank=rank,
             world_size=world_size,
         )
-        data_collate = collate_pretok
-    elif args.dataset_json:
+        return ds, collate_pretok, True
+    if args.dataset_json:
         image_root = args.image_root or osp.dirname(args.dataset_json)
         ds = GPT4oImageDataset(
             json_path=args.dataset_json,
@@ -445,22 +475,14 @@ def main() -> None:
             rank=rank,
             world_size=world_size,
         )
-        data_collate = collate_fn
-    else:
-        if not args.dataset_glob:
-            raise ValueError("Provide --dataset_glob, --dataset_json, or --pretok_glob.")
-        shard_paths = sorted(glob.glob(args.dataset_glob))
-        if not shard_paths:
-            raise FileNotFoundError(f"No tar shards found for glob: {args.dataset_glob}")
-        ds = InfinityMMShardDataset(
-            shard_paths=shard_paths,
-            text_source=args.text_source,
-            rank=rank,
-            world_size=world_size,
-        )
-        data_collate = collate_fn
+        return ds, collate_fn, False
+    raise ValueError("Provide --dataset_json or --pretok_glob.")
 
-    loader = DataLoader(
+
+def _build_loader(
+    args: argparse.Namespace, ds, data_collate, rank: int
+) -> DataLoader:
+    return DataLoader(
         ds,
         batch_size=args.batch_size,
         shuffle=False,
@@ -472,6 +494,243 @@ def main() -> None:
         prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
     )
 
+
+def _save_step_checkpoint(
+    args: argparse.Namespace,
+    wrapper: EmuNAR,
+    rank: int,
+    is_main: bool,
+    global_step: int,
+) -> None:
+    step_path = os.path.join(args.save_dir, f"nar_step{global_step}.pt")
+    if args.fsdp:
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import ShardedStateDictConfig, StateDictType
+
+        state_cfg = ShardedStateDictConfig(offload_to_cpu=True)
+        with FSDP.state_dict_type(wrapper, StateDictType.SHARDED_STATE_DICT, state_cfg):
+            state_dict = wrapper.state_dict()
+        torch.save(state_dict, step_path + f".rank{rank}.pt")
+        if is_main:
+            print("[INFO] saved step sharded:", step_path)
+        dist.barrier()
+    else:
+        if is_main:
+            torch.save(wrapper.state_dict(), step_path)
+            print("[INFO] saved step:", step_path)
+
+
+def _save_epoch_checkpoint(
+    args: argparse.Namespace,
+    wrapper: EmuNAR,
+    rank: int,
+    is_main: bool,
+    epoch: int,
+    save_epoch_mode: str,
+) -> None:
+    if save_epoch_mode == "none":
+        return
+    save_path = os.path.join(args.save_dir, f"nar_epoch{epoch}.pt")
+    if args.fsdp:
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import FullStateDictConfig, ShardedStateDictConfig, StateDictType
+
+        if save_epoch_mode == "full":
+            full_path = os.path.join(args.save_dir, f"nar_epoch{epoch}.full.pt")
+            state_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(wrapper, StateDictType.FULL_STATE_DICT, state_cfg):
+                state_dict = wrapper.state_dict()
+            if rank == 0:
+                torch.save(state_dict, full_path)
+                print("[INFO] saved full:", full_path)
+            dist.barrier()
+        else:
+            state_cfg = ShardedStateDictConfig(offload_to_cpu=True)
+            with FSDP.state_dict_type(wrapper, StateDictType.SHARDED_STATE_DICT, state_cfg):
+                state_dict = wrapper.state_dict()
+            torch.save(state_dict, save_path + f".rank{rank}.pt")
+            if is_main:
+                print("[INFO] saved sharded:", save_path)
+            dist.barrier()
+    else:
+        if is_main:
+            torch.save(wrapper.state_dict(), save_path)
+            print("[INFO] saved:", save_path)
+
+
+def _save_final_checkpoint(args: argparse.Namespace, wrapper: EmuNAR, rank: int) -> None:
+    if not args.fsdp or not args.save_full_state:
+        return
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+
+    final_path = os.path.join(args.save_dir, "nar_final.pt")
+    state_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    with FSDP.state_dict_type(wrapper, StateDictType.FULL_STATE_DICT, state_cfg):
+        state_dict = wrapper.state_dict()
+    if rank == 0:
+        torch.save(state_dict, final_path)
+        print("[INFO] saved full model:", final_path)
+    dist.barrier()
+
+
+def _run_epoch_generate(
+    args: argparse.Namespace,
+    wrapper: EmuNAR,
+    tokenizer,
+    vq_model,
+    vq_dtype,
+    device: torch.device,
+    visual_token_offset: int,
+    rank: int,
+    is_main: bool,
+    epoch: int,
+) -> Tuple[Any, Any]:
+    if not args.eval_generate_prompt:
+        return vq_model, vq_dtype
+    height = int(args.eval_generate_height)
+    width = int(args.eval_generate_width)
+    if height <= 0 or width <= 0:
+        if is_main:
+            print("[WARN] eval_generate_height/width must be set to enable generation.")
+        return vq_model, vq_dtype
+    out_dir = args.eval_generate_outdir or args.save_dir
+    if is_main:
+        os.makedirs(out_dir, exist_ok=True)
+
+    def _save_outputs(grid: torch.Tensor) -> None:
+        if not is_main:
+            return
+        grid_cpu = grid.detach().cpu()
+        torch.save(grid_cpu, os.path.join(out_dir, f"gen_epoch{epoch}.pt"))
+        if not args.eval_generate_decode:
+            return
+        nonlocal vq_model, vq_dtype
+        if vq_model is None or str(next(vq_model.parameters()).device) != str(device):
+            vq_model = build_vision_tokenizer(args.vq_type, args.vq_path, device=str(device))
+            vq_model.eval()
+            for p in vq_model.parameters():
+                p.requires_grad = False
+            vq_dtype = next(vq_model.parameters()).dtype
+        codes = grid_cpu - visual_token_offset
+        codes = codes.to(device=next(vq_model.parameters()).device, dtype=torch.long)
+        with torch.no_grad():
+            image = vq_model.decode_code(codes[None], shape=(1, height, width, 256)).float()
+        image = image[0].permute(1, 2, 0)
+        try:
+            from PIL import Image
+            import numpy as np
+
+            img = Image.fromarray(((image + 1.0) * 127.5).clamp(0, 255).cpu().numpy().astype(np.uint8))
+            img.save(os.path.join(out_dir, f"gen_epoch{epoch}.png"))
+        except Exception as exc:
+            print(f"[WARN] decode image failed: {exc}")
+
+    was_training = wrapper.training
+    wrapper.eval()
+
+    prompt_ids = _encode_text_ids(
+        tokenizer=tokenizer,
+        text_template=args.text_template,
+        text=args.eval_generate_prompt,
+        text_max_length=args.text_max_length,
+        add_boi=args.add_boi,
+        height=height,
+        width=width,
+    ).to(device)
+    if prompt_ids.dim() == 1:
+        prompt_ids = prompt_ids.unsqueeze(0)
+    prompt_attention = torch.ones((prompt_ids.size(0), prompt_ids.size(1)), dtype=torch.long, device=device)
+
+    mask_ids = wrapper.module if hasattr(wrapper, "module") else wrapper
+    mask_token_id = mask_ids.mask_token_id
+    grid = torch.full((1, height, width), mask_token_id, device=device, dtype=torch.long)
+    rows = torch.arange(height, device=device).unsqueeze(1).expand(height, width)
+    cols = torch.arange(width, device=device).unsqueeze(0).expand(height, width)
+    step_id = (rows + cols).reshape(-1)
+    max_step = int(step_id.max().item())
+
+    prev_fastpath = None
+    if hasattr(torch.backends, "mha"):
+        prev_fastpath = torch.backends.mha.get_fastpath_enabled()
+        torch.backends.mha.set_fastpath_enabled(False)
+    sdp_ctx = nullcontext()
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "sdp_kernel"):
+        sdp_ctx = torch.backends.cuda.sdp_kernel(
+            enable_flash=False, enable_mem_efficient=False, enable_math=True
+        )
+    with sdp_ctx, torch.no_grad():
+        for step in range(0, max_step + 1):
+            positions = (step_id == step).nonzero(as_tuple=False).view(-1)
+            if positions.numel() == 0:
+                continue
+            image_ids = grid.view(1, -1)
+            prev_positions = positions if step == 0 else (step_id == (step - 1)).nonzero(
+                as_tuple=False
+            ).view(-1)
+            positions = positions.to(device=device, dtype=torch.long)
+            prev_positions = prev_positions.to(device=device, dtype=torch.long)
+            outputs = wrapper(
+                input_ids=image_ids,
+                height=height,
+                width=width,
+                text_input_ids=prompt_ids,
+                text_attention_mask=prompt_attention,
+                step_positions=positions,
+                prev_positions=prev_positions,
+            )
+            step_logits = outputs["step_logits"]
+            if visual_token_offset:
+                step_logits = step_logits.clone()
+                step_logits[:, :, :visual_token_offset] = float("-inf")
+            step_pred = _sample_logits(
+                step_logits,
+                temperature=args.eval_generate_temperature,
+                top_k=args.eval_generate_top_k,
+                top_p=args.eval_generate_top_p,
+                sample_logits=args.eval_generate_sample,
+            )
+            if args.fsdp and dist.is_initialized():
+                dist.broadcast(step_pred, src=0)
+            grid.view(1, -1)[:, positions] = step_pred
+
+    if prev_fastpath is not None:
+        torch.backends.mha.set_fastpath_enabled(prev_fastpath)
+    _save_outputs(grid)
+    if args.fsdp and dist.is_initialized():
+        dist.barrier()
+    if was_training:
+        wrapper.train()
+    return vq_model, vq_dtype
+
+
+def main() -> None:
+    args = parse_args()
+    random.seed(args.seed)
+    rank, world_size, local_rank, device = _setup_distributed(args)
+
+    is_main = rank == 0
+    _prepare_output_dir(args, is_main)
+    if is_main and args.train_backbone:
+        print("[WARN] training full backbone; consider unfreezing after NAR heads converge.")
+
+    dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+    torch_dtype = dtype_map[args.dtype]
+
+    model_config = Emu3Config.from_pretrained(args.model_path, trust_remote_code=True)
+    backbone = _build_backbone(args, model_config, torch_dtype, device, is_main)
+    wrapper, visual_token_offset = _build_wrapper(args, backbone, model_config, torch_dtype, device)
+    wrapper = _wrap_fsdp_if_needed(args, wrapper, device, torch_dtype)
+    _resume_if_needed(args, wrapper, rank, is_main)
+    _freeze_backbone_if_needed(args, wrapper)
+    optimizer = _build_optimizer(args, wrapper)
+
+    tokenizer = _build_text_tokenizer(args.tokenizer_path)
+
+    ds, data_collate, use_pretok = _build_dataset(args, rank, world_size)
+    loader = _build_loader(args, ds, data_collate, rank)
+    vq_model, vq_dtype, vq_device = _build_vq(args, use_pretok, device)
+
     save_epoch_mode = args.save_epoch
     if save_epoch_mode == "auto":
         save_epoch_mode = "sharded" if args.fsdp else "full"
@@ -481,133 +740,20 @@ def main() -> None:
     accum_steps = max(1, args.grad_accum_steps)
     image_area = args.image_area or int(getattr(model_config, "image_area", 512 * 512))
 
-    def _run_epoch_generate(epoch: int) -> None:
-        if not args.eval_generate_prompt:
-            return
-        if not args.fsdp:
-            raise ValueError("eval_generate requires --fsdp for multi-GPU generation.")
-        height = int(args.eval_generate_height)
-        width = int(args.eval_generate_width)
-        if height <= 0 or width <= 0:
-            if is_main:
-                print("[WARN] eval_generate_height/width must be set to enable generation.")
-            return
-        out_dir = args.eval_generate_outdir or args.save_dir
-        if is_main:
-            os.makedirs(out_dir, exist_ok=True)
-
-        def _save_outputs(grid: torch.Tensor) -> None:
-            if not is_main:
-                return
-            grid_cpu = grid.detach().cpu()
-            torch.save(grid_cpu, os.path.join(out_dir, f"gen_epoch{epoch}.pt"))
-            if not args.eval_generate_decode:
-                return
-            nonlocal vq_model, vq_dtype
-            if vq_model is None or str(next(vq_model.parameters()).device) != str(device):
-                vq_model = build_vision_tokenizer(args.vq_type, args.vq_path, device=str(device))
-                vq_model.eval()
-                for p in vq_model.parameters():
-                    p.requires_grad = False
-                vq_dtype = next(vq_model.parameters()).dtype
-            codes = grid_cpu - visual_token_offset
-            codes = codes.to(device=next(vq_model.parameters()).device, dtype=torch.long)
-            with torch.no_grad():
-                image = vq_model.decode_code(codes[None], shape=(1, height, width, 256)).float()
-            image = image[0].permute(1, 2, 0)
-            try:
-                from PIL import Image
-                import numpy as np
-
-                img = Image.fromarray(
-                    ((image + 1.0) * 127.5).clamp(0, 255).cpu().numpy().astype(np.uint8)
-                )
-                img.save(os.path.join(out_dir, f"gen_epoch{epoch}.png"))
-            except Exception as exc:
-                print(f"[WARN] decode image failed: {exc}")
-
-        was_training = wrapper.training
-        wrapper.eval()
-
-        prompt_ids = _encode_text_ids(
-            tokenizer=tokenizer,
-            text_template=args.text_template,
-            text=args.eval_generate_prompt,
-            text_max_length=args.text_max_length,
-            add_boi=args.add_boi,
-            height=height,
-            width=width,
-        ).to(device)
-        if prompt_ids.dim() == 1:
-            prompt_ids = prompt_ids.unsqueeze(0)
-        prompt_attention = torch.ones(
-            (prompt_ids.size(0), prompt_ids.size(1)), dtype=torch.long, device=device
-        )
-
-        mask_token_id = wrapper.module.mask_token_id
-        grid = torch.full((1, height, width), mask_token_id, device=device, dtype=torch.long)
-        rows = torch.arange(height, device=device).unsqueeze(1).expand(height, width)
-        cols = torch.arange(width, device=device).unsqueeze(0).expand(height, width)
-        step_id = (rows + cols).reshape(-1)
-        max_step = int(step_id.max().item())
-
-        prev_fastpath = None
-        if hasattr(torch.backends, "mha"):
-            prev_fastpath = torch.backends.mha.get_fastpath_enabled()
-            torch.backends.mha.set_fastpath_enabled(False)
-        sdp_ctx = nullcontext()
-        if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "sdp_kernel"):
-            sdp_ctx = torch.backends.cuda.sdp_kernel(
-                enable_flash=False, enable_mem_efficient=False, enable_math=True
-            )
-        with sdp_ctx, torch.no_grad():
-            for step in range(0, max_step + 1):
-                positions = (step_id == step).nonzero(as_tuple=False).view(-1)
-                if positions.numel() == 0:
-                    continue
-                image_ids = grid.view(1, -1)
-                prev_positions = positions if step == 0 else (step_id == (step - 1)).nonzero(
-                    as_tuple=False
-                ).view(-1)
-                positions = positions.to(device=device, dtype=torch.long)
-                prev_positions = prev_positions.to(device=device, dtype=torch.long)
-                outputs = wrapper(
-                    input_ids=image_ids,
-                    height=height,
-                    width=width,
-                    text_input_ids=prompt_ids,
-                    text_attention_mask=prompt_attention,
-                    step_positions=positions,
-                    prev_positions=prev_positions,
-                )
-                step_logits = outputs["step_logits"]
-                if visual_token_offset:
-                    step_logits = step_logits.clone()
-                    step_logits[:, :, :visual_token_offset] = float("-inf")
-                if rank == 0:
-                    step_pred = _sample_logits(
-                        step_logits,
-                        temperature=args.eval_generate_temperature,
-                        top_k=args.eval_generate_top_k,
-                        top_p=args.eval_generate_top_p,
-                        sample_logits=args.eval_generate_sample,
-                    )
-                else:
-                    step_pred = torch.zeros(
-                        (1, positions.numel()), device=device, dtype=torch.long
-                    )
-                dist.broadcast(step_pred, src=0)
-                grid.view(1, -1)[:, positions] = step_pred
-
-        if prev_fastpath is not None:
-            torch.backends.mha.set_fastpath_enabled(prev_fastpath)
-        _save_outputs(grid)
-        dist.barrier()
-        if was_training:
-            wrapper.train()
     for epoch in range(args.epochs):
         if args.eval_generate_timing in ("start", "both"):
-            _run_epoch_generate(epoch)
+            vq_model, vq_dtype = _run_epoch_generate(
+                args,
+                wrapper,
+                tokenizer,
+                vq_model,
+                vq_dtype,
+                device,
+                visual_token_offset,
+                rank,
+                is_main,
+                epoch,
+            )
         if is_main:
             progress = tqdm(desc=f"epoch {epoch}")
         else:
@@ -704,22 +850,7 @@ def main() -> None:
             if progress is not None:
                 progress.update(1)
             if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
-                step_path = os.path.join(args.save_dir, f"nar_step{global_step}.pt")
-                if args.fsdp:
-                    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-                    from torch.distributed.fsdp import ShardedStateDictConfig, StateDictType
-
-                    state_cfg = ShardedStateDictConfig(offload_to_cpu=True)
-                    with FSDP.state_dict_type(wrapper, StateDictType.SHARDED_STATE_DICT, state_cfg):
-                        state_dict = wrapper.state_dict()
-                    torch.save(state_dict, step_path + f".rank{rank}.pt")
-                    if is_main:
-                        print("[INFO] saved step sharded:", step_path)
-                    dist.barrier()
-                else:
-                    if is_main:
-                        torch.save(wrapper.state_dict(), step_path)
-                        print("[INFO] saved step:", step_path)
+                _save_step_checkpoint(args, wrapper, rank, is_main, global_step)
 
             step += 1
 
@@ -740,49 +871,23 @@ def main() -> None:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-        save_path = os.path.join(args.save_dir, f"nar_epoch{epoch}.pt")
-        if save_epoch_mode != "none":
-            if args.fsdp:
-                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-                from torch.distributed.fsdp import FullStateDictConfig, ShardedStateDictConfig, StateDictType
-
-                if save_epoch_mode == "full":
-                    full_path = os.path.join(args.save_dir, f"nar_epoch{epoch}.full.pt")
-                    state_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-                    with FSDP.state_dict_type(wrapper, StateDictType.FULL_STATE_DICT, state_cfg):
-                        state_dict = wrapper.state_dict()
-                    if rank == 0:
-                        torch.save(state_dict, full_path)
-                        print("[INFO] saved full:", full_path)
-                    dist.barrier()
-                else:
-                    state_cfg = ShardedStateDictConfig(offload_to_cpu=True)
-                    with FSDP.state_dict_type(wrapper, StateDictType.SHARDED_STATE_DICT, state_cfg):
-                        state_dict = wrapper.state_dict()
-                    torch.save(state_dict, save_path + f".rank{rank}.pt")
-                    if is_main:
-                        print("[INFO] saved sharded:", save_path)
-                    dist.barrier()
-            else:
-                if is_main:
-                    torch.save(wrapper.state_dict(), save_path)
-                    print("[INFO] saved:", save_path)
+        _save_epoch_checkpoint(args, wrapper, rank, is_main, epoch, save_epoch_mode)
 
         if args.eval_generate_timing in ("end", "both"):
-            _run_epoch_generate(epoch)
+            vq_model, vq_dtype = _run_epoch_generate(
+                args,
+                wrapper,
+                tokenizer,
+                vq_model,
+                vq_dtype,
+                device,
+                visual_token_offset,
+                rank,
+                is_main,
+                epoch,
+            )
 
-    if args.fsdp and args.save_full_state:
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        from torch.distributed.fsdp import FullStateDictConfig, StateDictType
-
-        final_path = os.path.join(args.save_dir, "nar_final.pt")
-        state_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(wrapper, StateDictType.FULL_STATE_DICT, state_cfg):
-            state_dict = wrapper.state_dict()
-        if rank == 0:
-            torch.save(state_dict, final_path)
-            print("[INFO] saved full model:", final_path)
-        dist.barrier()
+    _save_final_checkpoint(args, wrapper, rank)
 
 
 if __name__ == "__main__":
