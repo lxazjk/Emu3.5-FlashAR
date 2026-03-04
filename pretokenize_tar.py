@@ -17,9 +17,36 @@ from tqdm import tqdm
 
 from src.vision_tokenizer import build_vision_tokenizer
 from src.utils.input_utils import smart_resize
-from emu_nar.data.infinity_mm import clean_text, extract_text_from_entry
+from emu_nar.data.gpt4o_image import clean_text
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+
+def extract_text_from_entry(entry: Dict, source: str) -> str:
+    conversations = entry.get("conversations") or []
+
+    def role_name(turn: Dict) -> str:
+        return (turn.get("from") or turn.get("role") or "").lower()
+
+    assistant_roles = {"gpt", "assistant"}
+    human_roles = {"human", "user"}
+    text = ""
+    if conversations:
+        if source == "assistant":
+            texts = [str(t["value"]) for t in conversations if role_name(t) in assistant_roles and t.get("value")]
+            text = texts[-1] if texts else ""
+        elif source == "human":
+            texts = [str(t["value"]) for t in conversations if role_name(t) in human_roles and t.get("value")]
+            text = texts[-1] if texts else ""
+        elif source == "both":
+            parts = [str(t["value"]) for t in conversations if t.get("value") and role_name(t) in assistant_roles | human_roles]
+            text = "\n".join(parts)
+    if not text:
+        for key in ("caption", "text", "summary", "title"):
+            if entry.get(key):
+                text = str(entry[key])
+                break
+    return clean_text(text)
 
 
 def parse_args():

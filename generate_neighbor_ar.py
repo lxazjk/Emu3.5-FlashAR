@@ -9,7 +9,7 @@ from transformers import AutoTokenizer
 
 from src.emu3p5 import Emu3Config, Emu3ForCausalLM
 from src.vision_tokenizer import build_vision_tokenizer
-from emu_nar.inference.neighbor_ar_wrapper import NeighborARWrapper
+from emu_nar.modeling_emu_nar import EmuNAR
 from emu_nar.lora import apply_lora_to_backbone, apply_progressive_lora_to_backbone
 
 
@@ -115,7 +115,7 @@ def main():
                 dropout=args.lora_dropout,
             )
 
-    wrapper = NeighborARWrapper(
+    wrapper = EmuNAR(
         pretrained_backbone=backbone.model,
         vocab_size=cfg.vocab_size,
         hidden_size=cfg.hidden_size,
