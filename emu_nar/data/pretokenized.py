@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import io
 import os.path as osp
+import random
 import tarfile
 from typing import Iterable, List
 
@@ -17,14 +18,27 @@ class PretokShardDataset(torch.utils.data.IterableDataset):
         shard_paths: Iterable[str],
         rank: int = 0,
         world_size: int = 1,
+        seed: int = 1234,
+        shuffle: bool = True,
     ) -> None:
         super().__init__()
         self.shard_paths = list(shard_paths)
         self.rank = rank
         self.world_size = world_size
+        self.seed = int(seed)
+        self.shuffle = bool(shuffle)
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
 
     def _iter_shards(self) -> List[str]:
-        shards = sorted(self.shard_paths)
+        shards = list(self.shard_paths)
+        if self.shuffle:
+            rng = random.Random(self.seed + self.epoch)
+            rng.shuffle(shards)
+        else:
+            shards = sorted(shards)
         if self.world_size > 1:
             shards = shards[self.rank :: self.world_size]
         worker = torch.utils.data.get_worker_info()
