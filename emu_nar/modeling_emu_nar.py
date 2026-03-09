@@ -16,6 +16,8 @@ Usage:
 
 from __future__ import annotations
 
+import copy
+import math
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -105,111 +107,26 @@ def _build_proximity_allow(
     return allow
 
 
-def _extract_interleaved_blocks(
-    prefix_ids: torch.Tensor,
-    img_token_id: int,
-    eoi_token_id: int,
-    eol_token_id: int,
-    visual_token_offset: int,
-) -> List[Tuple[List[int], int, int]]:
-    """Find complete rectangular image blocks inside a prefix sequence."""
-    seq = prefix_ids.tolist()
-    blocks: List[Tuple[List[int], int, int]] = []
-    idx = 0
-    while idx < len(seq):
-        if seq[idx] != img_token_id:
-            idx += 1
-            continue
-        end = idx + 1
-        while end < len(seq) and seq[end] != eoi_token_id:
-            end += 1
-        if end >= len(seq):
-            break
-        rows: List[List[int]] = []
-        current: List[int] = []
-        pos = idx + 1
-        while pos < end:
-            tok = seq[pos]
-            if tok == eol_token_id:
-                rows.append(current)
-                current = []
-            elif tok >= visual_token_offset:
-                current.append(pos)
-            pos += 1
-        if current or rows:
-            rows.append(current)
-        if rows and all(len(r) == len(rows[0]) and len(r) > 0 for r in rows):
-            positions = [p for row in rows for p in row]
-            blocks.append((positions, len(rows), len(rows[0])))
-        idx = end + 1
-    return blocks
-
-
-def _build_interleaved_prefix_allow(
-    prefix_ids: torch.Tensor,
-    device: torch.device,
-    img_token_id: int,
-    eoi_token_id: int,
-    eol_token_id: int,
-    visual_token_offset: int,
-) -> torch.Tensor:
-    """Build allow matrix for a text+image prefix: causal for text, proximity for images."""
-    prefix_len = prefix_ids.numel()
-    allow = torch.tril(
-        torch.ones(prefix_len, prefix_len, device=device, dtype=torch.bool)
-    )
-    blocks = _extract_interleaved_blocks(
-        prefix_ids=prefix_ids,
-        img_token_id=img_token_id,
-        eoi_token_id=eoi_token_id,
-        eol_token_id=eol_token_id,
-        visual_token_offset=visual_token_offset,
-    )
-    for positions, height, width in blocks:
-        if height * width != len(positions):
-            continue
-        step_id = _build_step_id(height, width, device)
-        block_allow = step_id[None, :] <= step_id[:, None]
-        pos = torch.tensor(positions, device=device, dtype=torch.long)
-        allow[pos[:, None], pos[None, :]] |= block_allow
-    return allow
-
-
-def build_interleaved_neighbor_ar_mask(
+def build_t2i_neighbor_ar_mask(
     prefix_ids: Optional[torch.Tensor],
     height: int,
     width: int,
     batch_size: int,
     device: torch.device,
     dtype: torch.dtype,
-    img_token_id: Optional[int] = None,
-    eoi_token_id: Optional[int] = None,
-    eol_token_id: Optional[int] = None,
-    visual_token_offset: Optional[int] = None,
     text_attention_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Build a 4-D attention mask for [prefix | new_image].
-
-    Returns:
-        attn_mask: (B, 1, T, T)  float mask (0 = attend, -inf = block)
-        step_id:   (H*W,)  diagonal step index for the new image block
+    Build a 4-D mask for pure T2I:
+      - prefix (text/special tokens) uses causal mask
+      - image tokens attend all valid prefix tokens
+      - image block uses diagonal-step proximity mask
     """
     if prefix_ids is None:
         prefix_ids = torch.empty((batch_size, 0), device=device, dtype=torch.long)
     if prefix_ids.dim() == 1:
         prefix_ids = prefix_ids.unsqueeze(0)
     prefix_len = prefix_ids.size(1)
-
-    if prefix_len > 0 and (
-        img_token_id is None
-        or eoi_token_id is None
-        or eol_token_id is None
-        or visual_token_offset is None
-    ):
-        raise ValueError(
-            "interleaved prefix requires img/eoi/eol ids and visual_token_offset"
-        )
 
     t_steps = height * width
     total = prefix_len + t_steps
@@ -218,37 +135,64 @@ def build_interleaved_neighbor_ar_mask(
     )
 
     if prefix_len > 0:
+        causal = torch.tril(
+            torch.ones(prefix_len, prefix_len, device=device, dtype=torch.bool)
+        )
+        diag = torch.eye(prefix_len, device=device, dtype=torch.bool)
         for b in range(batch_size):
-            prefix_allow = _build_interleaved_prefix_allow(
-                prefix_ids=prefix_ids[b],
-                device=device,
-                img_token_id=img_token_id,
-                eoi_token_id=eoi_token_id,
-                eol_token_id=eol_token_id,
-                visual_token_offset=visual_token_offset,
-            )
+            allow = causal.clone()
             if text_attention_mask is not None:
                 valid = text_attention_mask[b].to(device=device).bool()
-                invalid = ~valid
-                if invalid.any():
-                    prefix_allow[invalid, :] = False
-                    prefix_allow[:, invalid] = False
-                diag = torch.eye(prefix_len, device=device, dtype=torch.bool)
-                prefix_allow |= diag
-            attn[b, 0, :prefix_len, :prefix_len].masked_fill_(prefix_allow, 0.0)
-            # new image attends to valid prefix positions only
-            if text_attention_mask is not None:
-                valid = text_attention_mask[b].to(device=device).bool()
+                allow &= valid.unsqueeze(0) & valid.unsqueeze(1)
+                allow |= diag
                 attn[b, 0, prefix_len:, :prefix_len] = torch.where(
                     valid.unsqueeze(0), 0.0, float("-inf")
                 )
             else:
                 attn[b, 0, prefix_len:, :prefix_len] = 0.0
+            attn[b, 0, :prefix_len, :prefix_len].masked_fill_(allow, 0.0)
 
     step_id = _build_step_id(height, width, device)
     allowed = _build_proximity_allow(height, width, device)
     attn[:, 0, prefix_len:, prefix_len:].masked_fill_(allowed, 0.0)
     return attn, step_id
+
+
+def build_t2i_causal_mask(
+    prefix_ids: Optional[torch.Tensor],
+    height: int,
+    width: int,
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    text_attention_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Build a standard AR causal 4-D mask for T2I sequence:
+      [text_prefix][image_tokens]
+    """
+    if prefix_ids is None:
+        prefix_ids = torch.empty((batch_size, 0), device=device, dtype=torch.long)
+    if prefix_ids.dim() == 1:
+        prefix_ids = prefix_ids.unsqueeze(0)
+    prefix_len = prefix_ids.size(1)
+    image_len = height * width
+    total = prefix_len + image_len
+
+    causal = torch.tril(torch.ones((total, total), device=device, dtype=torch.bool))
+    eye = torch.eye(total, device=device, dtype=torch.bool)
+    attn = torch.full((batch_size, 1, total, total), float("-inf"), device=device, dtype=dtype)
+    image_valid = torch.ones((image_len,), device=device, dtype=torch.bool)
+    for b in range(batch_size):
+        if prefix_len > 0 and text_attention_mask is not None:
+            prefix_valid = text_attention_mask[b, :prefix_len].to(device=device).bool()
+        else:
+            prefix_valid = torch.ones((prefix_len,), device=device, dtype=torch.bool)
+        valid = torch.cat([prefix_valid, image_valid], dim=0)
+        allow = causal & valid.unsqueeze(0) & valid.unsqueeze(1)
+        allow |= eye
+        attn[b, 0].masked_fill_(allow, 0.0)
+    return attn
 
 
 # ============================================================================
@@ -278,10 +222,10 @@ class EmuNAR(nn.Module):
         visual_token_offset: Optional[int] = None,
         use_vertical_block: bool = True,
         vertical_layers: int = 1,
+        learnable_fuse: bool = False,
+        fuse_h_init: float = 0.5,
+        fuse_corner_h_init: float = -1.0,
         lm_head: Optional[nn.Linear] = None,
-        img_token_id: Optional[int] = None,
-        eol_token_id: Optional[int] = None,
-        eoi_token_id: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.backbone = pretrained_backbone
@@ -293,52 +237,57 @@ class EmuNAR(nn.Module):
         )
         self.visual_token_offset = visual_token_offset
         self.use_vertical_block = use_vertical_block
+        self.learnable_fuse = bool(learnable_fuse)
 
         cfg = getattr(pretrained_backbone, "config", None)
-        self.img_token_id = (
-            img_token_id
-            if img_token_id is not None
-            else getattr(cfg, "img_token_id", None)
-        )
-        self.eol_token_id = (
-            eol_token_id
-            if eol_token_id is not None
-            else getattr(cfg, "eol_token_id", None)
-        )
-        self.eoi_token_id = (
-            eoi_token_id
-            if eoi_token_id is not None
-            else getattr(cfg, "eoi_token_id", None)
-        )
 
         # --- prediction heads ---
         self.horizontal_head = nn.Linear(hidden_size, vocab_size)
 
         if use_vertical_block:
             layers = max(1, int(vertical_layers))
-            encoder_layer = nn.TransformerEncoderLayer(
-                d_model=hidden_size,
-                nhead=num_heads,
-                dim_feedforward=hidden_size * ff_mult,
-                dropout=dropout,
-                batch_first=True,
-                activation="gelu",
-            )
-            if layers == 1:
-                self.vertical_block = encoder_layer
-                self._vertical_uses_encoder = False
-            else:
-                self.vertical_block = nn.TransformerEncoder(
-                    encoder_layer, num_layers=layers
+            backbone_layers = getattr(pretrained_backbone, "layers", None)
+            if backbone_layers is None or len(backbone_layers) < layers:
+                raise ValueError(
+                    "pretrained_backbone.layers is missing or shorter than vertical_layers; "
+                    "cannot initialize vertical block from Emu3 decoder layers."
                 )
-                self._vertical_uses_encoder = True
-            self.vertical_norm = nn.LayerNorm(hidden_size)
+            # Reuse Emu3.5 transformer parameters by cloning decoder layers from backbone.
+            self.vertical_block = nn.ModuleList(
+                [copy.deepcopy(layer) for layer in backbone_layers[-layers:]]
+            )
+            for layer in self.vertical_block:
+                if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "is_causal"):
+                    layer.self_attn.is_causal = False
+            rms_eps = float(getattr(cfg, "rms_norm_eps", 1e-6))
+            from src.emu3p5.modeling_emu3 import Emu3RMSNorm
+
+            self.vertical_norm = Emu3RMSNorm(hidden_size, eps=rms_eps)
         else:
             self.vertical_block = None
             self.vertical_norm = None
-            self._vertical_uses_encoder = False
 
         self.vertical_head = nn.Linear(hidden_size, vocab_size)
+
+        if fuse_corner_h_init < 0:
+            fuse_corner_h_init = fuse_h_init
+        self.fuse_h_init = self._clamp_prob(float(fuse_h_init))
+        self.fuse_corner_h_init = self._clamp_prob(float(fuse_corner_h_init))
+        if self.learnable_fuse:
+            self.fuse_h_logit = nn.Parameter(
+                torch.tensor(
+                    [self._prob_to_logit(self.fuse_h_init)], dtype=torch.float32
+                )
+            )
+            self.fuse_corner_h_logit = nn.Parameter(
+                torch.tensor(
+                    [self._prob_to_logit(self.fuse_corner_h_init)],
+                    dtype=torch.float32,
+                )
+            )
+        else:
+            self.fuse_h_logit = None
+            self.fuse_corner_h_logit = None
 
         # initialise heads from lm_head if provided
         if lm_head is not None:
@@ -373,13 +322,67 @@ class EmuNAR(nn.Module):
         return seq.view(bsz, height, width, -1)
 
     @staticmethod
+    def _clamp_prob(prob: float) -> float:
+        return min(max(prob, 1e-4), 1.0 - 1e-4)
+
+    @classmethod
+    def _prob_to_logit(cls, prob: float) -> float:
+        p = cls._clamp_prob(prob)
+        return math.log(p / (1.0 - p))
+
+    def _fuse_weights(
+        self, device: torch.device, dtype: torch.dtype
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.learnable_fuse:
+            w_h = torch.sigmoid(self.fuse_h_logit).to(device=device, dtype=dtype)
+            w_h_corner = torch.sigmoid(self.fuse_corner_h_logit).to(
+                device=device, dtype=dtype
+            )
+        else:
+            w_h = torch.tensor(self.fuse_h_init, device=device, dtype=dtype)
+            w_h_corner = torch.tensor(
+                self.fuse_corner_h_init, device=device, dtype=dtype
+            )
+        return w_h, (1.0 - w_h), w_h_corner, (1.0 - w_h_corner)
+
+    def get_fuse_stats(self) -> Dict[str, torch.Tensor]:
+        device = self.horizontal_head.weight.device
+        dtype = self.horizontal_head.weight.dtype
+        w_h, w_v, w_h_corner, w_v_corner = self._fuse_weights(device, dtype)
+        return {
+            "fuse_w_h": w_h.detach().reshape(()),
+            "fuse_w_v": w_v.detach().reshape(()),
+            "fuse_w_h_corner": w_h_corner.detach().reshape(()),
+            "fuse_w_v_corner": w_v_corner.detach().reshape(()),
+        }
+
+    @staticmethod
     def _build_step_mask_2d(step_id: torch.Tensor) -> torch.Tensor:
-        """Bool mask for TransformerEncoder: True = blocked."""
+        """Bool mask where True means blocked attention."""
         allowed = step_id[None, :] <= step_id[:, None]
         return ~allowed
 
+    @staticmethod
+    def _build_step_attn_4d(
+        step_mask_2d: torch.Tensor, batch_size: int, dtype: torch.dtype
+    ) -> torch.Tensor:
+        seq_len = int(step_mask_2d.size(0))
+        mask = torch.zeros(
+            (batch_size, 1, seq_len, seq_len),
+            device=step_mask_2d.device,
+            dtype=dtype,
+        )
+        if step_mask_2d.any():
+            mask_val = torch.finfo(dtype).min
+            mask.masked_fill_(step_mask_2d.view(1, 1, seq_len, seq_len), mask_val)
+        return mask
+
     def _fuse_logits(
-        self, h_logits: torch.Tensor, v_logits: torch.Tensor
+        self,
+        h_logits: torch.Tensor,
+        v_logits: torch.Tensor,
+        cond_h_logits: torch.Tensor,
+        cond_v_logits: torch.Tensor,
     ) -> torch.Tensor:
         """
         Shift-and-merge horizontal / vertical logits into per-position predictions.
@@ -387,36 +390,54 @@ class EmuNAR(nn.Module):
         h_logits[b, h, w] predicts position (h, w+1);  after roll → position (h, w).
         v_logits[b, h, w] predicts position (h+1, w);  after roll → position (h, w).
         """
-        cond_logits = (h_logits[:, 0, 0, :] + v_logits[:, 0, 0, :]) / 2
+        w_h, w_v, w_h_corner, w_v_corner = self._fuse_weights(
+            h_logits.device, h_logits.dtype
+        )
+        cond_logits = (
+            w_h_corner * cond_h_logits[:, 0, :] + w_v_corner * cond_v_logits[:, 0, :]
+        )
         h_shift = h_logits.roll(shifts=1, dims=2)   # prediction for right neighbor
         v_shift = v_logits.roll(shifts=1, dims=1)   # prediction for bottom neighbor
         fused = torch.zeros_like(v_shift)
-        fused[:, 0, 0, :] = cond_logits              # corner: average
+        fused[:, 0, 0, :] = cond_logits              # corner: learnable fuse
         fused[:, 0, 1:, :] = h_shift[:, 0, 1:, :]   # first row: horizontal only
         fused[:, 1:, 0, :] = v_shift[:, 1:, 0, :]   # first col: vertical only
-        fused[:, 1:, 1:, :] = (                      # interior: average both
-            h_shift[:, 1:, 1:, :] + v_shift[:, 1:, 1:, :]
-        ) / 2
+        fused[:, 1:, 1:, :] = (                      # interior: learnable fuse
+            w_h * h_shift[:, 1:, 1:, :] + w_v * v_shift[:, 1:, 1:, :]
+        )
         return fused
 
     def _apply_vertical_block(
         self, image_hidden: torch.Tensor, step_mask_2d: torch.Tensor
     ) -> torch.Tensor:
         if self.vertical_block is not None:
-            if self._vertical_uses_encoder:
-                v_hidden = self.vertical_block(image_hidden, mask=step_mask_2d)
-            else:
-                v_hidden = self.vertical_block(image_hidden, src_mask=step_mask_2d)
+            bsz, seq_len, _ = image_hidden.shape
+            attn_mask = self._build_step_attn_4d(step_mask_2d, bsz, image_hidden.dtype)
+            position_ids = torch.arange(
+                seq_len, device=image_hidden.device, dtype=torch.long
+            ).unsqueeze(0).expand(bsz, -1)
+            v_hidden = image_hidden
+            for layer in self.vertical_block:
+                v_hidden = layer(
+                    hidden_states=v_hidden,
+                    attention_mask=attn_mask,
+                    position_ids=position_ids,
+                    output_attentions=False,
+                    use_cache=False,
+                )[0]
             return self.vertical_norm(v_hidden)
         return image_hidden
 
     def _compute_logits(
         self,
+        cond_hidden: torch.Tensor,
         image_hidden: torch.Tensor,
         height: int,
         width: int,
         step_mask_2d: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
+        cond_h_logits = self.horizontal_head(cond_hidden)
+        cond_v_logits = self.vertical_head(cond_hidden)
         h_grid = self._reshape_grid(image_hidden, height, width)
         h_logits = self.horizontal_head(h_grid)
 
@@ -424,7 +445,7 @@ class EmuNAR(nn.Module):
         v_grid = self._reshape_grid(v_hidden, height, width)
         v_logits = self.vertical_head(v_grid)
 
-        fused = self._fuse_logits(h_logits, v_logits)
+        fused = self._fuse_logits(h_logits, v_logits, cond_h_logits, cond_v_logits)
         return {"fused": fused, "h_logits": h_logits, "v_logits": v_logits}
 
     def _run_backbone(
@@ -461,23 +482,19 @@ class EmuNAR(nn.Module):
                 text_input_ids = text_input_ids.unsqueeze(0)
             prefix_len = text_input_ids.size(1)
             full_input_ids = torch.cat([text_input_ids, image_ids], dim=1)
-            attn_mask, step_id = build_interleaved_neighbor_ar_mask(
+            attn_mask, step_id = build_t2i_neighbor_ar_mask(
                 prefix_ids=text_input_ids,
                 height=height,
                 width=width,
                 batch_size=image_ids.size(0),
                 device=image_ids.device,
                 dtype=mask_dtype,
-                img_token_id=self.img_token_id,
-                eoi_token_id=self.eoi_token_id,
-                eol_token_id=self.eol_token_id,
-                visual_token_offset=self.visual_token_offset,
                 text_attention_mask=text_attention_mask,
             )
         else:
             prefix_len = 0
             full_input_ids = image_ids
-            attn_mask, step_id = build_interleaved_neighbor_ar_mask(
+            attn_mask, step_id = build_t2i_neighbor_ar_mask(
                 prefix_ids=None,
                 height=height,
                 width=width,
@@ -501,7 +518,8 @@ class EmuNAR(nn.Module):
         text_attention_mask: Optional[torch.Tensor] = None,
         step_positions: Optional[torch.Tensor] = None,
         prev_positions: Optional[torch.Tensor] = None,
-        chunked_loss: bool = False,
+        ar_distill: bool = False,
+        ar_distill_temperature: float = 2.0,
     ) -> Dict[str, torch.Tensor]:
         """
         Compute fused NAR loss.
@@ -513,7 +531,6 @@ class EmuNAR(nn.Module):
             text_attention_mask: (B, T) optional padding mask for prefix.
             step_positions: 1-D positions to predict (generation mode).
             prev_positions: 1-D positions whose hidden states are used.
-            chunked_loss: compute loss row-by-row to save memory.
         """
         bsz = input_ids.size(0)
 
@@ -528,25 +545,36 @@ class EmuNAR(nn.Module):
 
         # --- backbone forward ---
         hidden = self._run_backbone(full_input_ids, attn_mask)
-        image_hidden = hidden[:, prefix_len:, :] if prefix_len > 0 else hidden
+        if prefix_len > 0:
+            cond_hidden = hidden[:, prefix_len - 1 : prefix_len, :]
+            image_hidden = hidden[:, prefix_len:, :]
+        else:
+            cond_hidden = hidden[:, :1, :]
+            image_hidden = hidden
 
         # === step-based generation path ===
         if step_positions is not None and prev_positions is not None:
             return self._forward_step(
-                image_hidden, step_mask_2d, step_positions, prev_positions,
+                cond_hidden, image_hidden, step_mask_2d, step_positions, prev_positions,
                 height, width, input_ids.device,
             )
 
-        # === chunked loss path ===
-        if chunked_loss:
-            return self._forward_chunked(
-                image_hidden, step_mask_2d, input_ids, height, width,
-            )
-
         # === full loss path ===
-        return self._forward_full(
-            image_hidden, step_mask_2d, input_ids, height, width,
+        outputs = self._forward_full(
+            cond_hidden, image_hidden, step_mask_2d, input_ids, height, width,
         )
+        if ar_distill:
+            outputs["loss_distill"] = self._compute_ar_distill_loss(
+                full_input_ids=full_input_ids,
+                prefix_len=prefix_len,
+                text_input_ids=text_input_ids,
+                text_attention_mask=text_attention_mask,
+                student_v_logits=outputs["logits_v"],
+                height=height,
+                width=width,
+                temperature=ar_distill_temperature,
+            )
+        return outputs
 
     # ------------------------------------------------------------------
     # Forward sub-paths
@@ -554,6 +582,7 @@ class EmuNAR(nn.Module):
 
     def _forward_step(
         self,
+        cond_hidden: torch.Tensor,
         image_hidden: torch.Tensor,
         step_mask_2d: torch.Tensor,
         step_positions: torch.Tensor,
@@ -574,6 +603,8 @@ class EmuNAR(nn.Module):
             }
 
         v_hidden = self._apply_vertical_block(image_hidden, step_mask_2d)
+        cond_h_logits = self.horizontal_head(cond_hidden)
+        cond_v_logits = self.vertical_head(cond_hidden)
 
         h_prev = self.horizontal_head(image_hidden[:, prev_positions, :])
         v_prev = self.vertical_head(v_hidden[:, prev_positions, :])
@@ -609,101 +640,30 @@ class EmuNAR(nn.Module):
             up_idx = pos_to_idx[step_positions[v_only] - width]
             step_logits[:, v_only, :] = v_prev[:, up_idx, :]
 
-        # interior: average
+        w_h, w_v, w_h_corner, w_v_corner = self._fuse_weights(
+            h_prev.device, h_prev.dtype
+        )
+
+        # interior: learnable fuse
         if both_mask.any():
             left_idx = pos_to_idx[step_positions[both_mask] - 1]
             up_idx = pos_to_idx[step_positions[both_mask] - width]
             step_logits[:, both_mask, :] = (
-                h_prev[:, left_idx, :] + v_prev[:, up_idx, :]
-            ) / 2
+                w_h * h_prev[:, left_idx, :] + w_v * v_prev[:, up_idx, :]
+            )
 
-        # corner (0,0): average of self
+        # corner (0,0): learnable corner fuse
         if corner_mask.any():
-            idx = pos_to_idx[step_positions[corner_mask]]
-            step_logits[:, corner_mask, :] = (
-                h_prev[:, idx, :] + v_prev[:, idx, :]
-            ) / 2
+            cond_logits = (
+                w_h_corner * cond_h_logits[:, :1, :] + w_v_corner * cond_v_logits[:, :1, :]
+            )
+            step_logits[:, corner_mask, :] = cond_logits.expand(-1, int(corner_mask.sum().item()), -1)
 
         return {"step_logits": step_logits}
 
-    def _forward_chunked(
-        self,
-        image_hidden: torch.Tensor,
-        step_mask_2d: torch.Tensor,
-        input_ids: torch.Tensor,
-        height: int,
-        width: int,
-    ) -> Dict[str, torch.Tensor]:
-        """Row-by-row loss to save memory."""
-        bsz = input_ids.size(0)
-        device = input_ids.device
-        target_grid = input_ids.view(bsz, height, width)
-
-        v_hidden = self._apply_vertical_block(image_hidden, step_mask_2d)
-        h_grid = image_hidden.view(bsz, height, width, -1)
-        v_grid = v_hidden.view(bsz, height, width, -1)
-
-        loss_sum = torch.tensor(0.0, device=device)
-        loss_h_sum = torch.tensor(0.0, device=device)
-        loss_v_sum = torch.tensor(0.0, device=device)
-        v_prev = None
-
-        for r in range(height):
-            h_logits_row = self.horizontal_head(h_grid[:, r, :, :])
-            v_logits_row = self.vertical_head(v_grid[:, r, :, :])
-
-            fused_row = torch.empty_like(h_logits_row)
-            if r == 0:
-                fused_row[:, 0, :] = (
-                    h_logits_row[:, 0, :] + v_logits_row[:, 0, :]
-                ) / 2
-                if width > 1:
-                    fused_row[:, 1:, :] = h_logits_row[:, :-1, :]
-            else:
-                fused_row[:, 0, :] = v_prev[:, 0, :]
-                if width > 1:
-                    fused_row[:, 1:, :] = (
-                        h_logits_row[:, :-1, :] + v_prev[:, 1:, :]
-                    ) / 2
-
-            loss_sum += F.cross_entropy(
-                fused_row.reshape(-1, self.vocab_size),
-                target_grid[:, r, :].reshape(-1),
-                ignore_index=self.pad_token_id,
-                reduction="sum",
-            )
-            if width > 1:
-                loss_h_sum += F.cross_entropy(
-                    h_logits_row[:, :-1, :].reshape(-1, self.vocab_size),
-                    target_grid[:, r, 1:].reshape(-1),
-                    ignore_index=self.pad_token_id,
-                    reduction="sum",
-                )
-            if r > 0:
-                loss_v_sum += F.cross_entropy(
-                    v_prev.reshape(-1, self.vocab_size),
-                    target_grid[:, r, :].reshape(-1),
-                    ignore_index=self.pad_token_id,
-                    reduction="sum",
-                )
-            v_prev = v_logits_row
-
-        denom = float(bsz * height * width)
-        loss = loss_sum / denom
-        loss_h = (
-            loss_h_sum / float(bsz * height * (width - 1))
-            if width > 1
-            else torch.tensor(0.0, device=device, dtype=loss.dtype)
-        )
-        loss_v = (
-            loss_v_sum / float(bsz * (height - 1) * width)
-            if height > 1
-            else torch.tensor(0.0, device=device, dtype=loss.dtype)
-        )
-        return {"loss": loss, "loss_h": loss_h, "loss_v": loss_v}
-
     def _forward_full(
         self,
+        cond_hidden: torch.Tensor,
         image_hidden: torch.Tensor,
         step_mask_2d: torch.Tensor,
         input_ids: torch.Tensor,
@@ -713,7 +673,7 @@ class EmuNAR(nn.Module):
         """Standard full-grid loss."""
         bsz = input_ids.size(0)
         device = input_ids.device
-        logits = self._compute_logits(image_hidden, height, width, step_mask_2d)
+        logits = self._compute_logits(cond_hidden, image_hidden, height, width, step_mask_2d)
         fused = logits["fused"]
         h_logits = logits["h_logits"]
         v_logits = logits["v_logits"]
@@ -743,6 +703,7 @@ class EmuNAR(nn.Module):
         else:
             loss_v = torch.tensor(0.0, device=device, dtype=loss.dtype)
 
+        fuse_stats = self.get_fuse_stats()
         return {
             "loss": loss,
             "loss_h": loss_h,
@@ -750,7 +711,73 @@ class EmuNAR(nn.Module):
             "logits_h": h_logits,
             "logits_v": v_logits,
             "logits": fused,
+            **fuse_stats,
         }
+
+    def _compute_ar_distill_loss(
+        self,
+        full_input_ids: torch.Tensor,
+        prefix_len: int,
+        text_input_ids: Optional[torch.Tensor],
+        text_attention_mask: Optional[torch.Tensor],
+        student_v_logits: torch.Tensor,
+        height: int,
+        width: int,
+        temperature: float,
+    ) -> torch.Tensor:
+        """
+        AR distillation for vertical branch:
+          student at (r,c) predicting (r+1,c) vs AR teacher at prev token (q-1).
+        """
+        bsz = int(full_input_ids.size(0))
+        image_len = int(height * width)
+        if height <= 1:
+            return student_v_logits.new_zeros(())
+
+        student_flat = student_v_logits[:, :-1, :, :].reshape(bsz, -1, self.vocab_size)
+        q = torch.arange(width, image_len, device=full_input_ids.device, dtype=torch.long)
+
+        if student_flat.size(1) != int(q.numel()):
+            raise RuntimeError(
+                f"Distill alignment mismatch: student={student_flat.size(1)} teacher_targets={int(q.numel())}"
+            )
+
+        mask_dtype = next(self.backbone.parameters()).dtype
+        ar_attn = build_t2i_causal_mask(
+            prefix_ids=text_input_ids,
+            height=height,
+            width=width,
+            batch_size=bsz,
+            device=full_input_ids.device,
+            dtype=mask_dtype,
+            text_attention_mask=text_attention_mask,
+        )
+        with torch.no_grad():
+            ar_hidden = self._run_backbone(full_input_ids, ar_attn)
+        ar_image_hidden = ar_hidden[:, prefix_len:, :] if prefix_len > 0 else ar_hidden
+
+        # teacher at previous token predicts current target q in AR factorization.
+        prev_idx = q - 1
+
+        temp = max(float(temperature), 1e-5)
+        chunk = 64
+        kl_sum = student_flat.new_zeros(())
+        token_count = 0
+        for start in range(0, int(prev_idx.numel()), chunk):
+            end = min(start + chunk, int(prev_idx.numel()))
+            idx = prev_idx[start:end]
+            with torch.no_grad():
+                teacher_logits = self.horizontal_head(ar_image_hidden[:, idx, :])
+            student_logits = student_flat[:, start:end, :]
+            log_p = F.log_softmax(student_logits.float() / temp, dim=-1)
+            q_prob = F.softmax(teacher_logits.float() / temp, dim=-1)
+            kl = F.kl_div(log_p, q_prob, reduction="none").sum(dim=-1)
+            kl_sum = kl_sum + kl.sum()
+            token_count += int(kl.numel())
+
+        if token_count == 0:
+            return student_v_logits.new_zeros(())
+        return (kl_sum / float(token_count)) * (temp * temp)
 
     # ------------------------------------------------------------------
     # Generation
@@ -786,18 +813,14 @@ class EmuNAR(nn.Module):
             if text_input_ids.dim() == 1:
                 text_input_ids = text_input_ids.unsqueeze(0)
             prefix_len = text_input_ids.size(1)
-            attn_mask, step_id = build_interleaved_neighbor_ar_mask(
+            attn_mask, step_id = build_t2i_neighbor_ar_mask(
                 prefix_ids=text_input_ids,
                 height=height, width=width, batch_size=1,
                 device=device, dtype=mask_dtype,
-                img_token_id=self.img_token_id,
-                eoi_token_id=self.eoi_token_id,
-                eol_token_id=self.eol_token_id,
-                visual_token_offset=self.visual_token_offset,
             )
         else:
             prefix_len = 0
-            attn_mask, step_id = build_interleaved_neighbor_ar_mask(
+            attn_mask, step_id = build_t2i_neighbor_ar_mask(
                 prefix_ids=None,
                 height=height, width=width, batch_size=1,
                 device=device, dtype=mask_dtype,
@@ -808,14 +831,10 @@ class EmuNAR(nn.Module):
             if unconditional_text_input_ids.dim() == 1:
                 unconditional_text_input_ids = unconditional_text_input_ids.unsqueeze(0)
             u_prefix_len = unconditional_text_input_ids.size(1)
-            u_attn_mask, _ = build_interleaved_neighbor_ar_mask(
+            u_attn_mask, _ = build_t2i_neighbor_ar_mask(
                 prefix_ids=unconditional_text_input_ids,
                 height=height, width=width, batch_size=1,
                 device=device, dtype=mask_dtype,
-                img_token_id=self.img_token_id,
-                eoi_token_id=self.eoi_token_id,
-                eol_token_id=self.eol_token_id,
-                visual_token_offset=self.visual_token_offset,
             )
         else:
             u_prefix_len = 0
@@ -836,11 +855,14 @@ class EmuNAR(nn.Module):
                 full_ids = image_ids
 
             hidden = self._run_backbone(full_ids, attn_mask)
-            image_hidden = (
-                hidden[:, prefix_len:, :] if prefix_len > 0 else hidden
-            )
+            if prefix_len > 0:
+                cond_hidden = hidden[:, prefix_len - 1 : prefix_len, :]
+                image_hidden = hidden[:, prefix_len:, :]
+            else:
+                cond_hidden = hidden[:, :1, :]
+                image_hidden = hidden
             logits = self._compute_logits(
-                image_hidden, height, width, step_mask_2d
+                cond_hidden, image_hidden, height, width, step_mask_2d
             )
             fused = logits["fused"].reshape(1, -1, self.vocab_size)
             step_logits = fused[:, positions, :]
@@ -851,13 +873,14 @@ class EmuNAR(nn.Module):
                     [unconditional_text_input_ids, image_ids], dim=1
                 )
                 u_hidden = self._run_backbone(u_full_ids, u_attn_mask)
-                u_image_hidden = (
-                    u_hidden[:, u_prefix_len:, :]
-                    if u_prefix_len > 0
-                    else u_hidden
-                )
+                if u_prefix_len > 0:
+                    u_cond_hidden = u_hidden[:, u_prefix_len - 1 : u_prefix_len, :]
+                    u_image_hidden = u_hidden[:, u_prefix_len:, :]
+                else:
+                    u_cond_hidden = u_hidden[:, :1, :]
+                    u_image_hidden = u_hidden
                 u_logits = self._compute_logits(
-                    u_image_hidden, height, width, step_mask_2d
+                    u_cond_hidden, u_image_hidden, height, width, step_mask_2d
                 )
                 u_fused = u_logits["fused"].reshape(1, -1, self.vocab_size)
                 u_step_logits = u_fused[:, positions, :]
@@ -884,6 +907,7 @@ class EmuNAR(nn.Module):
 
 __all__ = [
     "EmuNAR",
-    "build_interleaved_neighbor_ar_mask",
+    "build_t2i_neighbor_ar_mask",
+    "build_t2i_causal_mask",
     "_sample_logits",
 ]

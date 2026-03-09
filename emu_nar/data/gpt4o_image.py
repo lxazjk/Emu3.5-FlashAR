@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os.path as osp
+import random
 from typing import Any, Dict, Iterable, List, Tuple
 
 import numpy as np
@@ -101,6 +102,8 @@ class GPT4oImageDataset(torch.utils.data.IterableDataset):
         image_root: str,
         rank: int = 0,
         world_size: int = 1,
+        seed: int = 1234,
+        shuffle: bool = True,
     ) -> None:
         super().__init__()
         with open(json_path, "r", encoding="utf-8") as f:
@@ -108,11 +111,25 @@ class GPT4oImageDataset(torch.utils.data.IterableDataset):
         self.image_root = image_root
         self.rank = rank
         self.world_size = world_size
+        self.seed = int(seed)
+        self.shuffle = bool(shuffle)
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
 
     def _iter_items(self) -> Iterable[dict]:
         items = self.items
+        if self.shuffle:
+            order = list(range(len(items)))
+            rng = random.Random(self.seed + self.epoch)
+            rng.shuffle(order)
+            items = [items[idx] for idx in order]
         if self.world_size > 1:
             items = items[self.rank :: self.world_size]
+        worker = torch.utils.data.get_worker_info()
+        if worker is not None and worker.num_workers > 1:
+            items = items[worker.id :: worker.num_workers]
         return items
 
     def __iter__(self):

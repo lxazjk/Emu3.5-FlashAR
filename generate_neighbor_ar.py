@@ -123,9 +123,6 @@ def main():
         pad_token_id=-100,
         mask_token_id=cfg.pad_token_id,
         visual_token_offset=visual_token_offset,
-        img_token_id=cfg.img_token_id,
-        eol_token_id=cfg.eol_token_id,
-        eoi_token_id=cfg.eoi_token_id,
         use_vertical_block=args.use_vertical_block,
         vertical_layers=args.vertical_layers,
     ).to(device=device, dtype=torch_dtype)
