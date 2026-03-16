@@ -17,10 +17,10 @@ Usage:
 from __future__ import annotations
 
 import copy
-import math
 from typing import Dict, List, Optional, Tuple
 
 import torch
+import torch.utils.checkpoint
 from torch import nn
 from torch.nn import functional as F
 
@@ -237,12 +237,13 @@ class EmuNAR(nn.Module):
         )
         self.visual_token_offset = visual_token_offset
         self.use_vertical_block = use_vertical_block
+        # Kept for backward-compatible constructor arguments; fusion now uses hv_gate.
         self.learnable_fuse = bool(learnable_fuse)
 
         cfg = getattr(pretrained_backbone, "config", None)
 
         # --- prediction heads ---
-        self.horizontal_head = nn.Linear(hidden_size, vocab_size)
+        self.horizontal_head = nn.Linear(hidden_size, vocab_size, bias=False)
 
         if use_vertical_block:
             layers = max(1, int(vertical_layers))
@@ -267,27 +268,20 @@ class EmuNAR(nn.Module):
             self.vertical_block = None
             self.vertical_norm = None
 
-        self.vertical_head = nn.Linear(hidden_size, vocab_size)
-
-        if fuse_corner_h_init < 0:
-            fuse_corner_h_init = fuse_h_init
-        self.fuse_h_init = self._clamp_prob(float(fuse_h_init))
-        self.fuse_corner_h_init = self._clamp_prob(float(fuse_corner_h_init))
-        if self.learnable_fuse:
-            self.fuse_h_logit = nn.Parameter(
-                torch.tensor(
-                    [self._prob_to_logit(self.fuse_h_init)], dtype=torch.float32
-                )
-            )
-            self.fuse_corner_h_logit = nn.Parameter(
-                torch.tensor(
-                    [self._prob_to_logit(self.fuse_corner_h_init)],
-                    dtype=torch.float32,
-                )
-            )
-        else:
-            self.fuse_h_logit = None
-            self.fuse_corner_h_logit = None
+        self.vertical_head = nn.Linear(hidden_size, vocab_size, bias=False)
+        # Per-position hv gate on SAME target-position features (train/inference consistent).
+        gate_proj_dim = max(64, hidden_size // 8)
+        self.hv_gate_mlp = nn.Sequential(
+            nn.Linear(2 * hidden_size, gate_proj_dim, bias=False),
+            nn.SiLU(),
+            nn.Linear(gate_proj_dim, 1, bias=True),
+        )
+        self.hv_gate_corner = nn.Linear(hidden_size, 1, bias=True)
+        # Start from symmetric mix (sigmoid(0)=0.5).
+        nn.init.zeros_(self.hv_gate_mlp[-1].weight)
+        nn.init.zeros_(self.hv_gate_mlp[-1].bias)
+        nn.init.zeros_(self.hv_gate_corner.weight)
+        nn.init.zeros_(self.hv_gate_corner.bias)
 
         # initialise heads from lm_head if provided
         if lm_head is not None:
@@ -321,40 +315,36 @@ class EmuNAR(nn.Module):
             raise ValueError(f"Expected seq_len={height * width}, got {seq_len}")
         return seq.view(bsz, height, width, -1)
 
+    def _hv_gate_from_pair(
+        self,
+        h_feat: torch.Tensor,
+        v_feat: torch.Tensor,
+        out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if h_feat.shape != v_feat.shape:
+            raise ValueError("h_feat and v_feat must share shape.")
+        if h_feat.numel() == 0:
+            shape = (*h_feat.shape[:-1], 1)
+            return torch.full(shape, 0.5, device=h_feat.device, dtype=out_dtype)
+        gate_dtype = self.hv_gate_mlp[0].weight.dtype
+        feat = torch.cat([h_feat, v_feat], dim=-1).to(gate_dtype)
+        gate = torch.sigmoid(self.hv_gate_mlp(feat))
+        return gate.to(dtype=out_dtype)
+
+    def _hv_gate_corner(
+        self,
+        cond_hidden: torch.Tensor,
+        out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        gate_dtype = self.hv_gate_corner.weight.dtype
+        gate = torch.sigmoid(self.hv_gate_corner(cond_hidden.to(gate_dtype)))
+        return gate.to(dtype=out_dtype)
+
     @staticmethod
-    def _clamp_prob(prob: float) -> float:
-        return min(max(prob, 1e-4), 1.0 - 1e-4)
-
-    @classmethod
-    def _prob_to_logit(cls, prob: float) -> float:
-        p = cls._clamp_prob(prob)
-        return math.log(p / (1.0 - p))
-
-    def _fuse_weights(
-        self, device: torch.device, dtype: torch.dtype
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.learnable_fuse:
-            w_h = torch.sigmoid(self.fuse_h_logit).to(device=device, dtype=dtype)
-            w_h_corner = torch.sigmoid(self.fuse_corner_h_logit).to(
-                device=device, dtype=dtype
-            )
-        else:
-            w_h = torch.tensor(self.fuse_h_init, device=device, dtype=dtype)
-            w_h_corner = torch.tensor(
-                self.fuse_corner_h_init, device=device, dtype=dtype
-            )
-        return w_h, (1.0 - w_h), w_h_corner, (1.0 - w_h_corner)
-
-    def get_fuse_stats(self) -> Dict[str, torch.Tensor]:
-        device = self.horizontal_head.weight.device
-        dtype = self.horizontal_head.weight.dtype
-        w_h, w_v, w_h_corner, w_v_corner = self._fuse_weights(device, dtype)
-        return {
-            "fuse_w_h": w_h.detach().reshape(()),
-            "fuse_w_v": w_v.detach().reshape(()),
-            "fuse_w_h_corner": w_h_corner.detach().reshape(()),
-            "fuse_w_v_corner": w_v_corner.detach().reshape(()),
-        }
+    def _binary_gate_entropy(prob: torch.Tensor) -> torch.Tensor:
+        prob = prob.clamp(1e-6, 1.0 - 1e-6)
+        entropy = -(prob * prob.log() + (1.0 - prob) * (1.0 - prob).log())
+        return entropy / 0.6931471805599453
 
     @staticmethod
     def _build_step_mask_2d(step_id: torch.Tensor) -> torch.Tensor:
@@ -383,48 +373,111 @@ class EmuNAR(nn.Module):
         v_logits: torch.Tensor,
         cond_h_logits: torch.Tensor,
         cond_v_logits: torch.Tensor,
-    ) -> torch.Tensor:
+        h_hidden: torch.Tensor,
+        v_hidden: torch.Tensor,
+        cond_hidden: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Shift-and-merge horizontal / vertical logits into per-position predictions.
 
         h_logits[b, h, w] predicts position (h, w+1);  after roll → position (h, w).
         v_logits[b, h, w] predicts position (h+1, w);  after roll → position (h, w).
         """
-        w_h, w_v, w_h_corner, w_v_corner = self._fuse_weights(
-            h_logits.device, h_logits.dtype
-        )
+        rw_corner = self._hv_gate_corner(cond_hidden, out_dtype=h_logits.dtype)  # [B,1,1]
         cond_logits = (
-            w_h_corner * cond_h_logits[:, 0, :] + w_v_corner * cond_v_logits[:, 0, :]
+            rw_corner[:, 0, :] * cond_h_logits[:, 0, :]
+            + (1.0 - rw_corner[:, 0, :]) * cond_v_logits[:, 0, :]
         )
         h_shift = h_logits.roll(shifts=1, dims=2)   # prediction for right neighbor
         v_shift = v_logits.roll(shifts=1, dims=1)   # prediction for bottom neighbor
         fused = torch.zeros_like(v_shift)
-        fused[:, 0, 0, :] = cond_logits              # corner: learnable fuse
+        fused[:, 0, 0, :] = cond_logits              # corner: hv_gate
         fused[:, 0, 1:, :] = h_shift[:, 0, 1:, :]   # first row: horizontal only
         fused[:, 1:, 0, :] = v_shift[:, 1:, 0, :]   # first col: vertical only
-        fused[:, 1:, 1:, :] = (                      # interior: learnable fuse
-            w_h * h_shift[:, 1:, 1:, :] + w_v * v_shift[:, 1:, 1:, :]
-        )
-        return fused
+        if h_shift.size(1) > 1 and h_shift.size(2) > 1:
+            h_feat_shift = h_hidden.roll(shifts=1, dims=2)
+            v_feat_shift = v_hidden.roll(shifts=1, dims=1)
+            rw_interior = self._hv_gate_from_pair(
+                h_feat_shift[:, 1:, 1:, :],
+                v_feat_shift[:, 1:, 1:, :],
+                out_dtype=h_logits.dtype,
+            )
+            fused[:, 1:, 1:, :] = (
+                rw_interior * h_shift[:, 1:, 1:, :]
+                + (1.0 - rw_interior) * v_shift[:, 1:, 1:, :]
+            )
+            gate_mean = rw_interior.mean().detach().reshape(())
+            gate_reg = self._hv_gate_from_pair(
+                h_feat_shift[:, 1:, 1:, :].detach(),
+                v_feat_shift[:, 1:, 1:, :].detach(),
+                out_dtype=h_logits.dtype,
+            )
+            gate_entropy = self._binary_gate_entropy(gate_reg).mean().reshape(())
+        else:
+            gate_mean = rw_corner.mean().detach().reshape(())
+            gate_reg = self._hv_gate_corner(
+                cond_hidden.detach(),
+                out_dtype=h_logits.dtype,
+            )
+            gate_entropy = self._binary_gate_entropy(gate_reg).mean().reshape(())
+        corner_mean = rw_corner.mean().detach().reshape(())
+        gate_stats = {
+            "hv_gate_h": gate_mean,
+            "hv_gate_v": (1.0 - gate_mean).detach().reshape(()),
+            "hv_gate_h_corner": corner_mean,
+            "hv_gate_v_corner": (1.0 - corner_mean).detach().reshape(()),
+            "hv_gate_entropy": gate_entropy.detach().reshape(()),
+            "loss_gate_collapse": (1.0 - gate_entropy).reshape(()),
+        }
+        return fused, gate_stats
 
     def _apply_vertical_block(
-        self, image_hidden: torch.Tensor, step_mask_2d: torch.Tensor
+        self,
+        image_hidden: torch.Tensor,
+        step_mask_2d: torch.Tensor,
+        position_offset: int = 0,
     ) -> torch.Tensor:
         if self.vertical_block is not None:
             bsz, seq_len, _ = image_hidden.shape
             attn_mask = self._build_step_attn_4d(step_mask_2d, bsz, image_hidden.dtype)
-            position_ids = torch.arange(
-                seq_len, device=image_hidden.device, dtype=torch.long
+            position_ids = (
+                torch.arange(seq_len, device=image_hidden.device, dtype=torch.long)
+                + int(position_offset)
             ).unsqueeze(0).expand(bsz, -1)
             v_hidden = image_hidden
+            # torch.utils.checkpoint needs at least one grad-requiring input.
+            # During vertical-only warmup the frozen backbone feeds detached
+            # hidden states into this block, so forcing checkpoint here would
+            # silently drop gradients for vertical_block parameters.
+            use_checkpoint = (
+                bool(getattr(self.backbone, "gradient_checkpointing", False))
+                and self.training
+                and image_hidden.requires_grad
+            )
             for layer in self.vertical_block:
-                v_hidden = layer(
-                    hidden_states=v_hidden,
-                    attention_mask=attn_mask,
-                    position_ids=position_ids,
-                    output_attentions=False,
-                    use_cache=False,
-                )[0]
+                if use_checkpoint:
+                    def _layer_forward(hidden_states: torch.Tensor, _layer: nn.Module = layer) -> torch.Tensor:
+                        return _layer(
+                            hidden_states=hidden_states,
+                            attention_mask=attn_mask,
+                            position_ids=position_ids,
+                            output_attentions=False,
+                            use_cache=False,
+                        )[0]
+
+                    v_hidden = torch.utils.checkpoint.checkpoint(
+                        _layer_forward,
+                        v_hidden,
+                        use_reentrant=False,
+                    )
+                else:
+                    v_hidden = layer(
+                        hidden_states=v_hidden,
+                        attention_mask=attn_mask,
+                        position_ids=position_ids,
+                        output_attentions=False,
+                        use_cache=False,
+                    )[0]
             return self.vertical_norm(v_hidden)
         return image_hidden
 
@@ -435,18 +488,31 @@ class EmuNAR(nn.Module):
         height: int,
         width: int,
         step_mask_2d: torch.Tensor,
+        position_offset: int = 0,
     ) -> Dict[str, torch.Tensor]:
         cond_h_logits = self.horizontal_head(cond_hidden)
         cond_v_logits = self.vertical_head(cond_hidden)
         h_grid = self._reshape_grid(image_hidden, height, width)
         h_logits = self.horizontal_head(h_grid)
 
-        v_hidden = self._apply_vertical_block(image_hidden, step_mask_2d)
+        v_hidden = self._apply_vertical_block(
+            image_hidden,
+            step_mask_2d,
+            position_offset=position_offset,
+        )
         v_grid = self._reshape_grid(v_hidden, height, width)
         v_logits = self.vertical_head(v_grid)
 
-        fused = self._fuse_logits(h_logits, v_logits, cond_h_logits, cond_v_logits)
-        return {"fused": fused, "h_logits": h_logits, "v_logits": v_logits}
+        fused, gate_stats = self._fuse_logits(
+            h_logits,
+            v_logits,
+            cond_h_logits,
+            cond_v_logits,
+            h_grid,
+            v_grid,
+            cond_hidden,
+        )
+        return {"fused": fused, "h_logits": h_logits, "v_logits": v_logits, **gate_stats}
 
     def _run_backbone(
         self,
@@ -460,6 +526,84 @@ class EmuNAR(nn.Module):
             use_cache=False,
         )
         return outputs.last_hidden_state
+
+    def _split_hidden_states(
+        self,
+        hidden: torch.Tensor,
+        prefix_len: int,
+        text_attention_mask: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Split backbone hidden states into:
+          - cond_hidden: one prefix state per sample used for (0, 0)
+          - image_hidden: H*W image token states
+
+        When text prefix is padded, use the last valid prefix token per sample
+        instead of the padded tail position.
+        """
+        if prefix_len <= 0:
+            return hidden[:, :1, :], hidden
+
+        prefix_hidden = hidden[:, :prefix_len, :]
+        image_hidden = hidden[:, prefix_len:, :]
+        if text_attention_mask is None:
+            return prefix_hidden[:, -1:, :], image_hidden
+
+        if text_attention_mask.dim() == 1:
+            text_attention_mask = text_attention_mask.unsqueeze(0)
+        if text_attention_mask.size(0) != hidden.size(0):
+            raise ValueError("text_attention_mask batch size mismatch.")
+        if text_attention_mask.size(1) < prefix_len:
+            raise ValueError("text_attention_mask length is smaller than prefix length.")
+
+        valid_lens = text_attention_mask[:, :prefix_len].to(device=hidden.device).long().sum(dim=1)
+        valid_lens = valid_lens.clamp(min=1, max=prefix_len)
+        gather_idx = (valid_lens - 1).view(-1, 1, 1).expand(-1, 1, prefix_hidden.size(-1))
+        cond_hidden = prefix_hidden.gather(dim=1, index=gather_idx)
+        return cond_hidden, image_hidden
+
+    def _cross_entropy_4d(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        chunked_loss: bool,
+        chunk_rows: int = 4,
+    ) -> torch.Tensor:
+        """
+        Cross entropy over [B, H, W, V] logits with optional row chunking.
+        Chunked mode reduces peak activation memory in loss computation.
+        """
+        if not chunked_loss:
+            return F.cross_entropy(
+                logits.reshape(-1, self.vocab_size),
+                targets.reshape(-1),
+                ignore_index=self.pad_token_id,
+            )
+
+        height = int(logits.size(1))
+        loss_sum = logits.new_zeros(())
+        token_count = 0
+        chunk_rows = max(1, int(chunk_rows))
+        for row_start in range(0, height, chunk_rows):
+            row_end = min(row_start + chunk_rows, height)
+            chunk_logits = logits[:, row_start:row_end, :, :].reshape(-1, self.vocab_size)
+            chunk_targets = targets[:, row_start:row_end, :].reshape(-1)
+            valid = chunk_targets.ne(self.pad_token_id)
+            valid_tokens = int(valid.sum().item())
+            if valid_tokens == 0:
+                continue
+            chunk_loss = F.cross_entropy(
+                chunk_logits,
+                chunk_targets,
+                ignore_index=self.pad_token_id,
+                reduction="sum",
+            )
+            loss_sum = loss_sum + chunk_loss
+            token_count += valid_tokens
+
+        if token_count == 0:
+            return logits.new_zeros(())
+        return loss_sum / float(token_count)
 
     # ------------------------------------------------------------------
     # Mask helpers (public, for external callers)
@@ -518,6 +662,7 @@ class EmuNAR(nn.Module):
         text_attention_mask: Optional[torch.Tensor] = None,
         step_positions: Optional[torch.Tensor] = None,
         prev_positions: Optional[torch.Tensor] = None,
+        chunked_loss: bool = False,
         ar_distill: bool = False,
         ar_distill_temperature: float = 2.0,
     ) -> Dict[str, torch.Tensor]:
@@ -545,23 +690,36 @@ class EmuNAR(nn.Module):
 
         # --- backbone forward ---
         hidden = self._run_backbone(full_input_ids, attn_mask)
-        if prefix_len > 0:
-            cond_hidden = hidden[:, prefix_len - 1 : prefix_len, :]
-            image_hidden = hidden[:, prefix_len:, :]
-        else:
-            cond_hidden = hidden[:, :1, :]
-            image_hidden = hidden
+        cond_hidden, image_hidden = self._split_hidden_states(
+            hidden=hidden,
+            prefix_len=prefix_len,
+            text_attention_mask=text_attention_mask,
+        )
 
         # === step-based generation path ===
         if step_positions is not None and prev_positions is not None:
             return self._forward_step(
-                cond_hidden, image_hidden, step_mask_2d, step_positions, prev_positions,
-                height, width, input_ids.device,
+                cond_hidden,
+                image_hidden,
+                step_mask_2d,
+                step_positions,
+                prev_positions,
+                height,
+                width,
+                input_ids.device,
+                prefix_len,
             )
 
         # === full loss path ===
         outputs = self._forward_full(
-            cond_hidden, image_hidden, step_mask_2d, input_ids, height, width,
+            cond_hidden,
+            image_hidden,
+            step_mask_2d,
+            input_ids,
+            height,
+            width,
+            prefix_len=prefix_len,
+            chunked_loss=chunked_loss,
         )
         if ar_distill:
             outputs["loss_distill"] = self._compute_ar_distill_loss(
@@ -590,6 +748,7 @@ class EmuNAR(nn.Module):
         height: int,
         width: int,
         device: torch.device,
+        position_offset: int = 0,
     ) -> Dict[str, torch.Tensor]:
         """Per-step logits for generation (no loss)."""
         bsz = image_hidden.size(0)
@@ -602,12 +761,18 @@ class EmuNAR(nn.Module):
                 )
             }
 
-        v_hidden = self._apply_vertical_block(image_hidden, step_mask_2d)
+        v_hidden = self._apply_vertical_block(
+            image_hidden,
+            step_mask_2d,
+            position_offset=position_offset,
+        )
         cond_h_logits = self.horizontal_head(cond_hidden)
         cond_v_logits = self.vertical_head(cond_hidden)
 
         h_prev = self.horizontal_head(image_hidden[:, prev_positions, :])
         v_prev = self.vertical_head(v_hidden[:, prev_positions, :])
+        h_prev_feat = image_hidden[:, prev_positions, :]
+        v_prev_feat = v_hidden[:, prev_positions, :]
 
         total = height * width
         pos_to_idx = torch.full((total,), -1, device=device, dtype=torch.long)
@@ -640,23 +805,23 @@ class EmuNAR(nn.Module):
             up_idx = pos_to_idx[step_positions[v_only] - width]
             step_logits[:, v_only, :] = v_prev[:, up_idx, :]
 
-        w_h, w_v, w_h_corner, w_v_corner = self._fuse_weights(
-            h_prev.device, h_prev.dtype
-        )
-
-        # interior: learnable fuse
+        # interior: per-position hv gate
         if both_mask.any():
             left_idx = pos_to_idx[step_positions[both_mask] - 1]
             up_idx = pos_to_idx[step_positions[both_mask] - width]
+            rw = self._hv_gate_from_pair(
+                h_prev_feat[:, left_idx, :],
+                v_prev_feat[:, up_idx, :],
+                out_dtype=h_prev.dtype,
+            )
             step_logits[:, both_mask, :] = (
-                w_h * h_prev[:, left_idx, :] + w_v * v_prev[:, up_idx, :]
+                rw * h_prev[:, left_idx, :] + (1.0 - rw) * v_prev[:, up_idx, :]
             )
 
-        # corner (0,0): learnable corner fuse
+        # corner (0,0): per-sample corner gate
         if corner_mask.any():
-            cond_logits = (
-                w_h_corner * cond_h_logits[:, :1, :] + w_v_corner * cond_v_logits[:, :1, :]
-            )
+            rw_corner = self._hv_gate_corner(cond_hidden, out_dtype=h_prev.dtype)
+            cond_logits = rw_corner * cond_h_logits[:, :1, :] + (1.0 - rw_corner) * cond_v_logits[:, :1, :]
             step_logits[:, corner_mask, :] = cond_logits.expand(-1, int(corner_mask.sum().item()), -1)
 
         return {"step_logits": step_logits}
@@ -669,41 +834,47 @@ class EmuNAR(nn.Module):
         input_ids: torch.Tensor,
         height: int,
         width: int,
+        prefix_len: int = 0,
+        chunked_loss: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """Standard full-grid loss."""
         bsz = input_ids.size(0)
         device = input_ids.device
-        logits = self._compute_logits(cond_hidden, image_hidden, height, width, step_mask_2d)
+        logits = self._compute_logits(
+            cond_hidden,
+            image_hidden,
+            height,
+            width,
+            step_mask_2d,
+            position_offset=prefix_len,
+        )
         fused = logits["fused"]
         h_logits = logits["h_logits"]
         v_logits = logits["v_logits"]
 
         target_grid = input_ids.view(bsz, height, width)
-        loss = F.cross_entropy(
-            fused.reshape(-1, self.vocab_size),
-            target_grid.reshape(-1),
-            ignore_index=self.pad_token_id,
+        loss = self._cross_entropy_4d(
+            fused, target_grid, chunked_loss=chunked_loss
         )
 
         if width > 1:
-            loss_h = F.cross_entropy(
-                h_logits[:, :, :-1, :].reshape(-1, self.vocab_size),
-                target_grid[:, :, 1:].reshape(-1),
-                ignore_index=self.pad_token_id,
+            loss_h = self._cross_entropy_4d(
+                h_logits[:, :, :-1, :],
+                target_grid[:, :, 1:],
+                chunked_loss=chunked_loss,
             )
         else:
             loss_h = torch.tensor(0.0, device=device, dtype=loss.dtype)
 
         if height > 1:
-            loss_v = F.cross_entropy(
-                v_logits[:, :-1, :, :].reshape(-1, self.vocab_size),
-                target_grid[:, 1:, :].reshape(-1),
-                ignore_index=self.pad_token_id,
+            loss_v = self._cross_entropy_4d(
+                v_logits[:, :-1, :, :],
+                target_grid[:, 1:, :],
+                chunked_loss=chunked_loss,
             )
         else:
             loss_v = torch.tensor(0.0, device=device, dtype=loss.dtype)
 
-        fuse_stats = self.get_fuse_stats()
         return {
             "loss": loss,
             "loss_h": loss_h,
@@ -711,7 +882,12 @@ class EmuNAR(nn.Module):
             "logits_h": h_logits,
             "logits_v": v_logits,
             "logits": fused,
-            **fuse_stats,
+            "hv_gate_h": logits["hv_gate_h"],
+            "hv_gate_v": logits["hv_gate_v"],
+            "hv_gate_h_corner": logits["hv_gate_h_corner"],
+            "hv_gate_v_corner": logits["hv_gate_v_corner"],
+            "hv_gate_entropy": logits["hv_gate_entropy"],
+            "loss_gate_collapse": logits["loss_gate_collapse"],
         }
 
     def _compute_ar_distill_loss(
@@ -790,7 +966,9 @@ class EmuNAR(nn.Module):
         width: int,
         device: torch.device,
         text_input_ids: Optional[torch.Tensor] = None,
+        text_attention_mask: Optional[torch.Tensor] = None,
         unconditional_text_input_ids: Optional[torch.Tensor] = None,
+        unconditional_text_attention_mask: Optional[torch.Tensor] = None,
         cfg_scale: float = 1.0,
         temperature: float = 1.0,
         top_k: int = 0,
@@ -806,41 +984,7 @@ class EmuNAR(nn.Module):
         grid = torch.full(
             (1, height, width), self.mask_token_id, device=device, dtype=torch.long
         )
-        mask_dtype = next(self.backbone.parameters()).dtype
-
-        # --- conditional mask ---
-        if text_input_ids is not None:
-            if text_input_ids.dim() == 1:
-                text_input_ids = text_input_ids.unsqueeze(0)
-            prefix_len = text_input_ids.size(1)
-            attn_mask, step_id = build_t2i_neighbor_ar_mask(
-                prefix_ids=text_input_ids,
-                height=height, width=width, batch_size=1,
-                device=device, dtype=mask_dtype,
-            )
-        else:
-            prefix_len = 0
-            attn_mask, step_id = build_t2i_neighbor_ar_mask(
-                prefix_ids=None,
-                height=height, width=width, batch_size=1,
-                device=device, dtype=mask_dtype,
-            )
-
-        # --- unconditional mask (for CFG) ---
-        if unconditional_text_input_ids is not None:
-            if unconditional_text_input_ids.dim() == 1:
-                unconditional_text_input_ids = unconditional_text_input_ids.unsqueeze(0)
-            u_prefix_len = unconditional_text_input_ids.size(1)
-            u_attn_mask, _ = build_t2i_neighbor_ar_mask(
-                prefix_ids=unconditional_text_input_ids,
-                height=height, width=width, batch_size=1,
-                device=device, dtype=mask_dtype,
-            )
-        else:
-            u_prefix_len = 0
-            u_attn_mask = None
-
-        step_mask_2d = self._build_step_mask_2d(step_id)
+        step_id = _build_step_id(height, width, device)
         max_step = int(step_id.max().item())
 
         for step in range(0, max_step + 1):
@@ -849,41 +993,37 @@ class EmuNAR(nn.Module):
                 continue
 
             image_ids = grid.view(1, -1)
-            if text_input_ids is not None:
-                full_ids = torch.cat([text_input_ids, image_ids], dim=1)
-            else:
-                full_ids = image_ids
-
-            hidden = self._run_backbone(full_ids, attn_mask)
-            if prefix_len > 0:
-                cond_hidden = hidden[:, prefix_len - 1 : prefix_len, :]
-                image_hidden = hidden[:, prefix_len:, :]
-            else:
-                cond_hidden = hidden[:, :1, :]
-                image_hidden = hidden
-            logits = self._compute_logits(
-                cond_hidden, image_hidden, height, width, step_mask_2d
+            prev_positions = (
+                positions
+                if step == 0
+                else (step_id == (step - 1)).nonzero(as_tuple=False).view(-1)
             )
-            fused = logits["fused"].reshape(1, -1, self.vocab_size)
-            step_logits = fused[:, positions, :]
+            positions = positions.to(device=device, dtype=torch.long)
+            prev_positions = prev_positions.to(device=device, dtype=torch.long)
+
+            outputs = self(
+                input_ids=image_ids,
+                height=height,
+                width=width,
+                text_input_ids=text_input_ids,
+                text_attention_mask=text_attention_mask,
+                step_positions=positions,
+                prev_positions=prev_positions,
+            )
+            step_logits = outputs["step_logits"]
 
             # classifier-free guidance
             if cfg_scale > 1.0 and unconditional_text_input_ids is not None:
-                u_full_ids = torch.cat(
-                    [unconditional_text_input_ids, image_ids], dim=1
+                u_outputs = self(
+                    input_ids=image_ids,
+                    height=height,
+                    width=width,
+                    text_input_ids=unconditional_text_input_ids,
+                    text_attention_mask=unconditional_text_attention_mask,
+                    step_positions=positions,
+                    prev_positions=prev_positions,
                 )
-                u_hidden = self._run_backbone(u_full_ids, u_attn_mask)
-                if u_prefix_len > 0:
-                    u_cond_hidden = u_hidden[:, u_prefix_len - 1 : u_prefix_len, :]
-                    u_image_hidden = u_hidden[:, u_prefix_len:, :]
-                else:
-                    u_cond_hidden = u_hidden[:, :1, :]
-                    u_image_hidden = u_hidden
-                u_logits = self._compute_logits(
-                    u_cond_hidden, u_image_hidden, height, width, step_mask_2d
-                )
-                u_fused = u_logits["fused"].reshape(1, -1, self.vocab_size)
-                u_step_logits = u_fused[:, positions, :]
+                u_step_logits = u_outputs["step_logits"]
                 step_logits = (
                     u_step_logits + cfg_scale * (step_logits - u_step_logits)
                 )
