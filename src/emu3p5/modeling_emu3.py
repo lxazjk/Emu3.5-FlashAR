@@ -60,6 +60,11 @@ if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 
+try:
+    from torch.nn.attention.flex_attention import flex_attention
+except Exception:
+    flex_attention = None
+
 
 # This makes `_prepare_4d_causal_attention_mask` a leaf function in the FX graph.
 # It means that the function will not be traced through and simply appear as a node in the graph.
@@ -399,6 +404,7 @@ class Emu3Attention(nn.Module):
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
+        rotary_seq_len = kv_seq_len
         if past_key_value is not None:
             if self.layer_idx is None:
                 raise ValueError(
@@ -407,7 +413,12 @@ class Emu3Attention(nn.Module):
                     "with a layer index."
                 )
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+            rotary_seq_len = kv_seq_len
+        if position_ids is not None:
+            # Allow callers to pass offset position ids (e.g. image-only sub-sequences
+            # that should stay aligned with the original full-sequence positions).
+            rotary_seq_len = max(rotary_seq_len, int(position_ids.max().item()) + 1)
+        cos, sin = self.rotary_emb(value_states, seq_len=rotary_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
@@ -511,9 +522,13 @@ class Emu3FlashAttention2(Emu3Attention):
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
+        rotary_seq_len = kv_seq_len
         if past_key_value is not None:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+            rotary_seq_len = kv_seq_len
+        if position_ids is not None:
+            rotary_seq_len = max(rotary_seq_len, int(position_ids.max().item()) + 1)
+        cos, sin = self.rotary_emb(value_states, seq_len=rotary_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
@@ -705,9 +720,13 @@ class Emu3SdpaAttention(Emu3Attention):
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
+        rotary_seq_len = kv_seq_len
         if past_key_value is not None:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+            rotary_seq_len = kv_seq_len
+        if position_ids is not None:
+            rotary_seq_len = max(rotary_seq_len, int(position_ids.max().item()) + 1)
+        cos, sin = self.rotary_emb(value_states, seq_len=rotary_seq_len)
 
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
@@ -749,10 +768,106 @@ class Emu3SdpaAttention(Emu3Attention):
         return attn_output, None, past_key_value
 
 
+class Emu3FlexAttention(Emu3Attention):
+    """
+    Emu3 attention backed by torch flex_attention.
+
+    This path is used only for full-sequence masked attention without KV cache.
+    Unsupported cases fall back to the eager implementation.
+    """
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if (
+            flex_attention is None
+            or output_attentions
+            or use_cache
+            or past_key_value is not None
+            or hidden_states.device.type != "cuda"
+            or attention_mask is None
+        ):
+            return super().forward(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+            )
+
+        bsz, q_len, _ = hidden_states.size()
+
+        if self.config.pretraining_tp > 1:
+            key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
+            query_slices = self.q_proj.weight.split(
+                (self.num_heads * self.head_dim) // self.config.pretraining_tp, dim=0
+            )
+            key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
+            value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
+
+            query_states = [F.linear(hidden_states, query_slices[i]) for i in range(self.config.pretraining_tp)]
+            query_states = torch.cat(query_states, dim=-1)
+
+            key_states = [F.linear(hidden_states, key_slices[i]) for i in range(self.config.pretraining_tp)]
+            key_states = torch.cat(key_states, dim=-1)
+
+            value_states = [F.linear(hidden_states, value_slices[i]) for i in range(self.config.pretraining_tp)]
+            value_states = torch.cat(value_states, dim=-1)
+        else:
+            query_states = self.q_proj(hidden_states)
+            key_states = self.k_proj(hidden_states)
+            value_states = self.v_proj(hidden_states)
+
+        query_states = self.q_norm(query_states.view(bsz, q_len, self.num_heads, self.head_dim)).transpose(1, 2)
+        key_states = self.k_norm(key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        kv_seq_len = key_states.shape[-2]
+        rotary_seq_len = kv_seq_len
+        if position_ids is not None:
+            rotary_seq_len = max(rotary_seq_len, int(position_ids.max().item()) + 1)
+        cos, sin = self.rotary_emb(value_states, seq_len=rotary_seq_len)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+            raise ValueError(
+                f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+            )
+
+        allow_mask = attention_mask[:, 0, :, :] == 0
+        neg_inf = torch.finfo(query_states.dtype).min
+
+        def score_mod(score, batch, head, q_idx, kv_idx):
+            keep = allow_mask[batch, q_idx, kv_idx]
+            return torch.where(keep, score, torch.full_like(score, neg_inf))
+
+        attn_output = flex_attention(
+            query_states.contiguous(),
+            key_states.contiguous(),
+            value_states.contiguous(),
+            score_mod=score_mod,
+        )
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        attn_output = self.o_proj(attn_output)
+        return attn_output, None, past_key_value
+
+
 EMU3_ATTENTION_CLASSES = {
     "eager": Emu3Attention,
     "flash_attention_2": Emu3FlashAttention2,
     "sdpa": Emu3SdpaAttention,
+    "flex_attention": Emu3FlexAttention,
 }
 
 
@@ -858,6 +973,7 @@ class Emu3PreTrainedModel(PreTrainedModel):
     _skip_keys_device_placement = "past_key_values"
     _supports_flash_attn_2 = True
     _supports_sdpa = True
+    _supports_flex_attn = True
     _supports_cache_class = True
 
     def _init_weights(self, module):
