@@ -1,19 +1,27 @@
 # -*- coding: utf-8 -*-
 # NAR-aware interleaved generation for Emu3.5.
 
-import glob
-import os
-import os.path as osp
 import re
-import subprocess
-import sys
-from typing import Generator, List, Dict, Any, Optional
+from typing import Generator, List, Any
 
-from PIL import Image
 import numpy as np
 import torch
 
-from emu_nar.modeling_emu_nar import EmuNAR
+from emu_nar.model import EmuNAR
+from emu_nar.inference.token_utils import (
+    collect_hw_tokens as _collect_hw_tokens,
+    get_digit_token_ids as _get_digit_token_ids,
+    get_special_ids as _get_special_ids,
+    parse_hw_from_tokens as _parse_hw_from_tokens,
+    sample_next_token as _sample_next_token,
+)
+from src.utils.generation_utils import multimodal_decode
+from src.utils.nar_checkpoint_utils import (
+    infer_vertical_from_state as _infer_vertical_from_state,
+    load_state_with_fuse_compat as _load_state_with_fuse_compat,
+    resolve_nar_ckpt_path as _resolve_nar_ckpt_path,
+    safe_torch_load as _safe_torch_load,
+)
 
 
 @torch.no_grad()
@@ -45,154 +53,43 @@ def generate(
             force_same_image_size=force_same_image_size,
         )
 
-
-def _get_special_ids(cfg, tokenizer):
-    if hasattr(cfg, "special_token_ids"):
-        return cfg.special_token_ids
-    return {k: tokenizer.encode(v)[0] for k, v in cfg.special_tokens.items()}
-
-
-def _get_digit_token_ids(tokenizer) -> set[int]:
-    digits = [str(i) for i in range(10)] + ["*"]
-    ids = set()
-    for d in digits:
-        ids.add(tokenizer.encode(d, add_special_tokens=False)[0])
-    return ids
-
-
-def _sample_next_token(logits, temperature, top_k, top_p):
-    logits = logits / max(temperature, 1e-5)
-    if top_k > 0:
-        top_k = min(top_k, logits.size(-1))
-        cutoff = torch.topk(logits, top_k)[0][..., -1, None]
-        logits = torch.where(logits < cutoff, torch.full_like(logits, -float("inf")), logits)
-    if top_p < 1.0:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-        sorted_indices_to_remove = cumulative_probs > top_p
-        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-        sorted_indices_to_remove[..., 0] = 0
-        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-        logits = logits.masked_fill(indices_to_remove, -float("inf"))
-    probs = torch.softmax(logits, dim=-1)
-    return torch.multinomial(probs, num_samples=1)
-
-
-def _parse_hw_from_tokens(tokenizer, hw_tokens: List[int]) -> tuple[int, int]:
-    hw_str = tokenizer.decode(hw_tokens)
-    h_str, w_str = hw_str.split("*")
-    return int(h_str), int(w_str)
-
-
-def _collect_hw_tokens(seq: List[int], boi_id: int, img_id: int) -> List[int]:
-    last_boi = len(seq) - 1 - seq[::-1].index(boi_id)
-    last_img = len(seq) - 1 - seq[::-1].index(img_id)
-    return seq[last_boi + 1 : last_img]
-
-
-def _strip_shard_suffix(path: str) -> str:
-    match = re.match(r"^(.*)\\.rank\\d+\\.pt$", path)
-    return match.group(1) if match else path
-
-
-def _auto_merge_sharded_ckpt(cfg, base_path: str, output_path: str, world_size: int) -> None:
-    if osp.exists(output_path):
-        return
-    merge_script = osp.join(osp.dirname(__file__), "..", "merge_sharded_ckpt.py")
-    merge_script = osp.normpath(merge_script)
-    if not osp.exists(merge_script):
-        raise FileNotFoundError(f"Missing merge script: {merge_script}")
-
-    cmd = [
-        sys.executable,
-        "-m",
-        "torch.distributed.run",
-        "--standalone",
-        "--nproc_per_node",
-        str(world_size),
-        merge_script,
-        "--model_path",
-        cfg.model_path,
-        "--ckpt_base",
-        base_path,
-        "--output_path",
-        output_path,
-        "--dtype",
-        getattr(cfg, "nar_merge_dtype", "bf16"),
-        "--fsdp_wrap_policy",
-        getattr(cfg, "nar_fsdp_wrap_policy", "transformer"),
-        "--fsdp_min_params",
-        str(getattr(cfg, "nar_fsdp_min_params", 1_000_000)),
-        "--vertical_layers",
-        str(getattr(cfg, "nar_vertical_layers", 1)),
-    ]
-    if getattr(cfg, "nar_use_vertical_block", False):
-        cmd.append("--use_vertical_block")
-    else:
-        cmd.append("--no-use_vertical_block")
-
-    lora_layers = int(getattr(cfg, "nar_lora_layers", 0))
-    lora_r = int(getattr(cfg, "nar_lora_r", 0))
-    if lora_layers > 0 and lora_r > 0:
-        cmd.extend(
-            [
-                "--lora_layers",
-                str(lora_layers),
-                "--lora_r",
-                str(lora_r),
-                "--lora_alpha",
-                str(getattr(cfg, "nar_lora_alpha", float(lora_r))),
-                "--lora_dropout",
-                str(getattr(cfg, "nar_lora_dropout", 0.0)),
-            ]
-        )
-
-    env = os.environ.copy()
-    print(f"[INFO] Merging sharded NAR ckpt -> {output_path}")
-    subprocess.run(cmd, check=True, env=env)
-
-
-def _resolve_nar_ckpt_path(cfg) -> str:
-    nar_ckpt_path = getattr(cfg, "nar_ckpt_path", "")
-    if not nar_ckpt_path:
-        raise ValueError("nar_ckpt_path is required for NAR generation.")
-    nar_ckpt_path = _strip_shard_suffix(nar_ckpt_path)
-
-    if osp.exists(nar_ckpt_path):
-        return nar_ckpt_path
-
-    if nar_ckpt_path.endswith(".pt"):
-        full_candidate = nar_ckpt_path[:-3] + ".full.pt"
-    else:
-        full_candidate = nar_ckpt_path + ".full.pt"
-    if osp.exists(full_candidate):
-        return full_candidate
-
-    shard_paths = sorted(glob.glob(nar_ckpt_path + ".rank*.pt"))
-    if not shard_paths and nar_ckpt_path.endswith(".pt"):
-        base = nar_ckpt_path[:-3]
-        shard_paths = sorted(glob.glob(base + ".rank*.pt"))
-        if shard_paths:
-            nar_ckpt_path = base
-
-    if not shard_paths:
-        raise FileNotFoundError(f"NAR ckpt not found: {nar_ckpt_path}")
-
-    output_path = nar_ckpt_path + ".full.pt"
-    _auto_merge_sharded_ckpt(cfg, nar_ckpt_path, output_path, len(shard_paths))
-    if not osp.exists(output_path):
-        raise FileNotFoundError(f"Failed to merge sharded ckpt: {output_path}")
-    return output_path
-
-
 def _get_nar_wrapper(cfg, model) -> EmuNAR:
     if hasattr(model, "nar_wrapper"):
         return model.nar_wrapper
-    nar_ckpt_path = _resolve_nar_ckpt_path(cfg)
+    nar_ckpt_path = _resolve_nar_ckpt_path(
+        nar_ckpt_path=getattr(cfg, "nar_ckpt_path", ""),
+        model_path=cfg.model_path,
+        merge_dtype=getattr(cfg, "nar_merge_dtype", "bf16"),
+        fsdp_wrap_policy=getattr(cfg, "nar_fsdp_wrap_policy", "transformer"),
+        fsdp_min_params=int(getattr(cfg, "nar_fsdp_min_params", 1_000_000)),
+        use_vertical_block=getattr(cfg, "nar_use_vertical_block", None),
+        vertical_layers=int(getattr(cfg, "nar_vertical_layers", 0)),
+        lora_layers=int(getattr(cfg, "nar_lora_layers", 0)),
+        lora_r=int(getattr(cfg, "nar_lora_r", 0)),
+        lora_alpha=getattr(cfg, "nar_lora_alpha", None),
+        lora_dropout=float(getattr(cfg, "nar_lora_dropout", 0.0)),
+    )
 
+    state = _safe_torch_load(nar_ckpt_path)
     model_config = model.config
     visual_token_offset = int(model_config.eoi_token_id) + 1
-    vertical_layers = getattr(cfg, "nar_vertical_layers", getattr(model_config, "nar_vertical_layers", 1))
+    inferred_use_vertical, inferred_vertical_layers = _infer_vertical_from_state(state)
+    nar_use_vertical = getattr(cfg, "nar_use_vertical_block", None)
+    if nar_use_vertical is None:
+        use_vertical_block = inferred_use_vertical
+    else:
+        use_vertical_block = bool(nar_use_vertical)
+
+    cfg_vertical_layers = int(getattr(cfg, "nar_vertical_layers", 0))
+    if cfg_vertical_layers > 0:
+        vertical_layers = cfg_vertical_layers
+    elif inferred_vertical_layers > 0:
+        vertical_layers = inferred_vertical_layers
+    else:
+        vertical_layers = int(getattr(model_config, "nar_vertical_layers", 1))
+    if use_vertical_block and vertical_layers <= 0:
+        vertical_layers = 1
+
     wrapper = EmuNAR(
         pretrained_backbone=model.model,
         vocab_size=model_config.vocab_size,
@@ -201,12 +98,11 @@ def _get_nar_wrapper(cfg, model) -> EmuNAR:
         pad_token_id=-100,
         mask_token_id=model_config.pad_token_id,
         visual_token_offset=visual_token_offset,
-        use_vertical_block=getattr(cfg, "nar_use_vertical_block", False),
+        use_vertical_block=use_vertical_block,
         vertical_layers=vertical_layers,
         lm_head=model.lm_head,
     )
-    state = torch.load(nar_ckpt_path, map_location="cpu")
-    wrapper.load_state_dict(state, strict=True)
+    _load_state_with_fuse_compat(wrapper, state, load_desc="load NAR ckpt")
     wrapper = wrapper.to(next(model.parameters()).device)
     wrapper.eval()
     model.nar_wrapper = wrapper
@@ -387,62 +283,3 @@ def streaming_generate(
             yield {"type": "image", "image": c}
         else:
             yield {"type": "text", "text": c}
-
-
-@torch.no_grad()
-def multimodal_decode(
-    outputs,
-    tokenizer,
-    vision_tokenizer,
-):
-    outputs = outputs.replace("<|extra_101|>", "").replace("<|extra_204|>", "")
-    pattern = re.compile(
-        rf"({re.escape(tokenizer.bog_token)}.*?{re.escape(tokenizer.eog_token)}|"
-        rf"{re.escape(tokenizer.boc_token)}.*?{re.escape(tokenizer.eoc_token)}|"
-        rf"{re.escape(tokenizer.boi_token)}.*?{re.escape(tokenizer.eoi_token)})",
-        re.DOTALL,
-    )
-    multimodal_output = []
-    chunks = re.split(pattern, outputs)
-    for c in chunks:
-        if len(c) == 0:
-            continue
-        if tokenizer.boi_token in c and tokenizer.eoi_token in c:
-            image = decode_image(c, tokenizer, vision_tokenizer)
-            if image is not None:
-                multimodal_output.append(("image", image))
-        elif tokenizer.bog_token in c and tokenizer.eog_token in c:
-            multimodal_output.append(
-                ("global_cot", c.replace(tokenizer.bog_token, "").replace(tokenizer.eog_token, ""))
-            )
-        elif tokenizer.boc_token in c and tokenizer.eoc_token in c:
-            multimodal_output.append(
-                ("image_cot", c.replace(tokenizer.boc_token, "").replace(tokenizer.eoc_token, ""))
-            )
-        elif tokenizer.boi_token not in c and len(c.strip()) > 0:
-            multimodal_output.append(("text", c))
-    return multimodal_output
-
-
-def decode_image(image_string, tokenizer, vision_tokenizer):
-    image: List[List[int]] = []
-    image_rows = re.split(re.escape(tokenizer.eol_token), image_string)
-    for r in image_rows:
-        token_ids = re.findall(r"<\|visual token (\d+)\|>", r)
-        if len(token_ids) > 0:
-            row_token = [int(m) for m in token_ids]
-            image.append(row_token)
-    try:
-        image = torch.tensor(
-            image, dtype=torch.long, device=next(iter(vision_tokenizer.parameters())).device
-        )
-        h, w = image.shape
-        image = vision_tokenizer.decode_code(image[None], shape=(1, h, w, 256)).float()
-        image = image[0].permute(1, 2, 0)
-        image = Image.fromarray(
-            ((image + 1.0) * 127.5).clamp(0, 255).detach().cpu().numpy().astype(np.uint8)
-        )
-        return image
-    except Exception as ex:
-        print(f"decode image failed {ex}")
-        return None
