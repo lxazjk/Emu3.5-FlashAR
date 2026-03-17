@@ -1,0 +1,273 @@
+# -*- coding: utf-8 -*-
+
+import argparse
+import glob
+import io
+import json
+import os
+import os.path as osp
+import tarfile
+from typing import Dict, Iterable, Iterator, Tuple
+
+import numpy as np
+import torch
+import torch.distributed as dist
+from PIL import Image, ImageFile
+from tqdm import tqdm
+
+from src.vision_tokenizer import build_vision_tokenizer
+from src.utils.input_utils import smart_resize
+from emu_nar.data.gpt4o_image import clean_text
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+
+def extract_text_from_entry(entry: Dict, source: str) -> str:
+    conversations = entry.get("conversations") or []
+
+    def role_name(turn: Dict) -> str:
+        return (turn.get("from") or turn.get("role") or "").lower()
+
+    assistant_roles = {"gpt", "assistant"}
+    human_roles = {"human", "user"}
+    text = ""
+    if conversations:
+        if source == "assistant":
+            texts = [str(t["value"]) for t in conversations if role_name(t) in assistant_roles and t.get("value")]
+            text = texts[-1] if texts else ""
+        elif source == "human":
+            texts = [str(t["value"]) for t in conversations if role_name(t) in human_roles and t.get("value")]
+            text = texts[-1] if texts else ""
+        elif source == "both":
+            parts = [str(t["value"]) for t in conversations if t.get("value") and role_name(t) in assistant_roles | human_roles]
+            text = "\n".join(parts)
+    if not text:
+        for key in ("caption", "text", "summary", "title"):
+            if entry.get(key):
+                text = str(entry[key])
+                break
+    return clean_text(text)
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--input_dir", default="")
+    p.add_argument("--output_dir", required=True)
+    p.add_argument("--split", type=str, default="train")
+    p.add_argument("--json_path", type=str, default="")
+    p.add_argument("--image_root", type=str, default="")
+    p.add_argument("--output_prefix", type=str, default="pretokenized")
+    p.add_argument("--shard_size", type=int, default=5000)
+    p.add_argument(
+        "--text_source",
+        type=str,
+        default="assistant",
+        choices=["assistant", "human", "both", "caption"],
+    )
+    p.add_argument("--vq_path", required=True)
+    p.add_argument("--vq_type", type=str, default="ibq")
+    p.add_argument("--vq_device", type=str, default="auto")
+    p.add_argument("--image_area", type=int, default=1048576)
+    p.add_argument("--grid_height", type=int, default=0)
+    p.add_argument("--grid_width", type=int, default=0)
+    p.add_argument("--max_height", type=int, default=0)
+    p.add_argument("--max_width", type=int, default=0)
+    return p.parse_args()
+
+
+def _encode_image_to_tokens(
+    image: Image.Image,
+    vq_model,
+    image_area: int,
+    grid_height: int,
+    grid_width: int,
+    max_height: int,
+    max_width: int,
+) -> torch.Tensor:
+    if grid_height > 0 and grid_width > 0:
+        image = image.resize((grid_width * 16, grid_height * 16), Image.BICUBIC)
+    else:
+        image = smart_resize(image, image_area)
+
+    w, h = image.size
+    device = next(vq_model.parameters()).device
+    dtype = next(vq_model.parameters()).dtype
+    image_t = torch.tensor((np.array(image) / 127.5 - 1.0)).to(device, dtype).permute(2, 0, 1)
+    with torch.no_grad():
+        _, _, token = vq_model.encode(image_t[None])
+        token = token[-1].view(h // 16, w // 16)
+
+    if max_height > 0:
+        token = token[:max_height]
+    if max_width > 0:
+        token = token[:, :max_width]
+
+    return token.cpu()
+
+
+def _write_member(tar_out: tarfile.TarFile, name: str, data: bytes) -> None:
+    info = tarfile.TarInfo(name=name)
+    info.size = len(data)
+    tar_out.addfile(info, io.BytesIO(data))
+
+
+def _iter_json_samples(
+    json_path: str,
+    image_root: str,
+    rank: int,
+    world_size: int,
+) -> Iterator[Tuple[str, str, str]]:
+    with open(json_path, "r", encoding="utf-8") as f:
+        items = json.load(f)
+    if world_size > 1:
+        items = items[rank::world_size]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        prompt = clean_text(str(item.get("input_prompt") or ""))
+        output_image = item.get("output_image")
+        if not prompt or not output_image:
+            continue
+        image_path = output_image
+        if not osp.isabs(image_path):
+            image_path = osp.join(image_root, output_image)
+        stem = osp.splitext(osp.basename(output_image))[0]
+        yield stem, prompt, image_path
+
+
+def _next_output_path(out_dir: str, prefix: str, rank: int, idx: int) -> str:
+    while True:
+        out_path = osp.join(out_dir, f"{prefix}.rank{rank}.part{idx}.tar")
+        if not osp.exists(out_path):
+            return out_path
+        idx += 1
+
+
+def main():
+    args = parse_args()
+    rank = 0
+    world_size = 1
+    local_rank = 0
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        if not dist.is_initialized():
+            dist.init_process_group("nccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    in_split = os.path.join(args.input_dir, args.split)
+    out_split = os.path.join(args.output_dir, args.split)
+    os.makedirs(out_split, exist_ok=True)
+
+    vq_device = args.vq_device
+    if vq_device in ("auto", "cuda"):
+        vq_device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
+    vq_model = build_vision_tokenizer(args.vq_type, args.vq_path, device=vq_device)
+    vq_model.eval()
+
+    if args.json_path:
+        image_root = args.image_root or osp.dirname(args.json_path)
+        samples = list(_iter_json_samples(args.json_path, image_root, rank, world_size))
+        it: Iterable[Tuple[str, str, str]] = tqdm(samples, desc=f"rank {rank}") if rank == 0 else samples
+        shard_size = max(1, int(args.shard_size))
+        shard_idx = 0
+        out_count = 0
+        out = None
+        for stem, prompt, image_path in it:
+            if out is None or out_count >= shard_size:
+                if out is not None:
+                    out.close()
+                out_path = _next_output_path(out_split, args.output_prefix, rank, shard_idx)
+                out = tarfile.open(out_path, "w")
+                out_count = 0
+                shard_idx += 1
+            try:
+                image = Image.open(image_path).convert("RGB")
+                tokens = _encode_image_to_tokens(
+                    image,
+                    vq_model,
+                    args.image_area,
+                    args.grid_height,
+                    args.grid_width,
+                    args.max_height,
+                    args.max_width,
+                )
+            except Exception:
+                continue
+            buf = io.BytesIO()
+            torch.save(tokens, buf)
+            _write_member(out, f"{stem}.pt", buf.getvalue())
+            _write_member(out, f"{stem}.txt", prompt.encode("utf-8"))
+            out_count += 1
+        if out is not None:
+            out.close()
+        return
+
+    shards = sorted(glob.glob(os.path.join(in_split, "*.tar")))
+    if not shards:
+        raise FileNotFoundError(f"No tar shards found under {in_split}")
+    if world_size > 1:
+        shards = shards[rank::world_size]
+
+    it = tqdm(shards, desc=f"rank {rank}") if rank == 0 else shards
+    for shard in it:
+        out_path = os.path.join(out_split, os.path.basename(shard))
+        if os.path.exists(out_path):
+            print(f"[INFO] skip existing {out_path}")
+            continue
+        print(f"[INFO] processing {shard} -> {out_path}")
+        with tarfile.open(shard, "r:*") as tf, tarfile.open(out_path, "w") as out:
+            bucket: Dict[str, Dict[str, bytes]] = {}
+            for member in tf:
+                if not member.isfile():
+                    continue
+                name = os.path.basename(member.name)
+                stem, ext = os.path.splitext(name)
+                ext = ext.lower()
+                fobj = tf.extractfile(member)
+                if fobj is None:
+                    continue
+                if ext in (".jpg", ".jpeg", ".png", ".webp"):
+                    bucket.setdefault(stem, {})["image"] = fobj.read()
+                elif ext in (".txt", ".caption", ".caption.txt"):
+                    bucket.setdefault(stem, {})["text"] = fobj.read()
+                elif ext == ".json":
+                    try:
+                        meta = json.loads(fobj.read().decode("utf-8"))
+                    except Exception:
+                        continue
+                    text = extract_text_from_entry(meta, args.text_source)
+                    if text:
+                        bucket.setdefault(stem, {})["text"] = text.encode("utf-8")
+                else:
+                    continue
+
+                entry = bucket.get(stem)
+                if entry is None:
+                    continue
+                if "image" not in entry or "text" not in entry:
+                    continue
+
+                try:
+                    image = Image.open(io.BytesIO(entry["image"])).convert("RGB")
+                    tokens = _encode_image_to_tokens(
+                        image,
+                        vq_model,
+                        args.image_area,
+                        args.grid_height,
+                        args.grid_width,
+                        args.max_height,
+                        args.max_width,
+                    )
+                except Exception:
+                    del bucket[stem]
+                    continue
+                buf = io.BytesIO()
+                torch.save(tokens, buf)
+                _write_member(out, f"{stem}.pt", buf.getvalue())
+                _write_member(out, f"{stem}.txt", entry["text"])
+                del bucket[stem]
+
+
+if __name__ == "__main__":
+    main()

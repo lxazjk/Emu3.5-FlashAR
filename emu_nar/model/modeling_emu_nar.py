@@ -17,12 +17,14 @@ Usage:
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import functional as F
+from transformers.cache_utils import DynamicCache
 
 
 # ============================================================================
@@ -955,6 +957,546 @@ class EmuNAR(nn.Module):
             return student_v_logits.new_zeros(())
         return (kl_sum / float(token_count)) * (temp * temp)
 
+    def _build_cfg_text_batch(
+        self,
+        text_input_ids: torch.Tensor,
+        text_attention_mask: Optional[torch.Tensor],
+        unconditional_text_input_ids: torch.Tensor,
+        unconditional_text_attention_mask: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if text_input_ids.dim() == 1:
+            text_input_ids = text_input_ids.unsqueeze(0)
+        if unconditional_text_input_ids.dim() == 1:
+            unconditional_text_input_ids = unconditional_text_input_ids.unsqueeze(0)
+
+        if text_attention_mask is None:
+            text_attention_mask = torch.ones_like(text_input_ids, dtype=torch.long)
+        elif text_attention_mask.dim() == 1:
+            text_attention_mask = text_attention_mask.unsqueeze(0)
+        if unconditional_text_attention_mask is None:
+            unconditional_text_attention_mask = torch.ones_like(
+                unconditional_text_input_ids, dtype=torch.long
+            )
+        elif unconditional_text_attention_mask.dim() == 1:
+            unconditional_text_attention_mask = unconditional_text_attention_mask.unsqueeze(0)
+
+        if text_input_ids.size(0) != unconditional_text_input_ids.size(0):
+            raise ValueError("CFG text batch size mismatch between cond and uncond prompts.")
+
+        max_len = max(text_input_ids.size(1), unconditional_text_input_ids.size(1))
+        pad_id = int(self.mask_token_id)
+
+        def _pad(ids: torch.Tensor, mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+            if ids.size(1) == max_len:
+                return ids, mask
+            padded_ids = ids.new_full((ids.size(0), max_len), pad_id)
+            padded_mask = mask.new_zeros((mask.size(0), max_len))
+            padded_ids[:, : ids.size(1)] = ids
+            padded_mask[:, : mask.size(1)] = mask
+            return padded_ids, padded_mask
+
+        uncond_ids, uncond_mask = _pad(
+            unconditional_text_input_ids,
+            unconditional_text_attention_mask.to(dtype=torch.long),
+        )
+        cond_ids, cond_mask = _pad(
+            text_input_ids,
+            text_attention_mask.to(dtype=torch.long),
+        )
+        return (
+            torch.cat([uncond_ids, cond_ids], dim=0),
+            torch.cat([uncond_mask, cond_mask], dim=0),
+        )
+
+    @staticmethod
+    def _normalize_text_batch(
+        text_input_ids: Optional[torch.Tensor],
+        text_attention_mask: Optional[torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if text_input_ids is None:
+            return None, None
+        if text_input_ids.dim() == 1:
+            text_input_ids = text_input_ids.unsqueeze(0)
+        if text_attention_mask is None:
+            text_attention_mask = torch.ones_like(text_input_ids, dtype=torch.long)
+        elif text_attention_mask.dim() == 1:
+            text_attention_mask = text_attention_mask.unsqueeze(0)
+        return text_input_ids, text_attention_mask.to(
+            device=text_input_ids.device, dtype=torch.long
+        )
+
+    @staticmethod
+    def _gather_last_valid_hidden(
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if attention_mask is None:
+            return hidden_states[:, -1:, :]
+        valid_lens = attention_mask.long().sum(dim=1).clamp(
+            min=1, max=hidden_states.size(1)
+        )
+        gather_idx = (valid_lens - 1).view(-1, 1, 1).expand(
+            -1, 1, hidden_states.size(-1)
+        )
+        return hidden_states.gather(dim=1, index=gather_idx)
+
+    @staticmethod
+    def _build_kv_attention_mask(
+        *,
+        batch_size: int,
+        current_len: int,
+        past_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        prefix_attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        prefix_len = 0 if prefix_attention_mask is None else int(prefix_attention_mask.size(1))
+        total_kv = prefix_len + past_len + current_len
+        attn_mask = torch.zeros(
+            (batch_size, 1, current_len, total_kv),
+            device=device,
+            dtype=dtype,
+        )
+        if prefix_len > 0:
+            invalid_prefix = ~prefix_attention_mask.to(device=device).bool()
+            if invalid_prefix.any():
+                attn_mask[:, :, :, :prefix_len] = attn_mask[:, :, :, :prefix_len].masked_fill(
+                    invalid_prefix[:, None, None, :],
+                    torch.finfo(dtype).min,
+                )
+        return attn_mask
+
+    @staticmethod
+    def _build_kv_attention_mask_2d(
+        *,
+        batch_size: int,
+        current_len: int,
+        past_len: int,
+        device: torch.device,
+        prefix_attention_mask: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        prefix_len = 0 if prefix_attention_mask is None else int(prefix_attention_mask.size(1))
+        if prefix_len <= 0:
+            return None
+        prefix_attention_mask = prefix_attention_mask.to(device=device, dtype=torch.long)
+        if bool(prefix_attention_mask.all()):
+            return None
+        total_kv = prefix_len + past_len + current_len
+        attn_mask = torch.ones(
+            (batch_size, total_kv),
+            device=device,
+            dtype=prefix_attention_mask.dtype,
+        )
+        attn_mask[:, :prefix_len] = prefix_attention_mask
+        return attn_mask
+
+    def _backbone_uses_flash_attention_2(self) -> bool:
+        return bool(getattr(self.backbone, "_use_flash_attention_2", False))
+
+    def _vertical_uses_flash_attention_2(self) -> bool:
+        if self.vertical_block is None or len(self.vertical_block) == 0:
+            return False
+        first_attn = getattr(self.vertical_block[0], "self_attn", None)
+        cfg = getattr(first_attn, "config", None)
+        return bool(getattr(cfg, "_attn_implementation", "") == "flash_attention_2")
+
+    @contextmanager
+    def _temporary_backbone_non_causal(self):
+        if not self._backbone_uses_flash_attention_2():
+            yield
+            return
+        original_flags = []
+        for layer in getattr(self.backbone, "layers", []):
+            self_attn = getattr(layer, "self_attn", None)
+            if self_attn is None or not hasattr(self_attn, "is_causal"):
+                continue
+            original_flags.append((self_attn, bool(self_attn.is_causal)))
+            self_attn.is_causal = False
+        try:
+            yield
+        finally:
+            for self_attn, is_causal in original_flags:
+                self_attn.is_causal = is_causal
+
+    def _prefill_generation_prefix(
+        self,
+        text_input_ids: torch.Tensor,
+        text_attention_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, DynamicCache, int, torch.Tensor]:
+        prefix_cache = DynamicCache()
+        outputs = self.backbone(
+            input_ids=text_input_ids,
+            attention_mask=text_attention_mask,
+            past_key_values=prefix_cache,
+            use_cache=True,
+            return_dict=True,
+        )
+        cond_hidden = self._gather_last_valid_hidden(
+            outputs.last_hidden_state,
+            text_attention_mask,
+        )
+        return (
+            cond_hidden,
+            outputs.past_key_values,
+            int(text_input_ids.size(1)),
+            text_attention_mask,
+        )
+
+    def _append_backbone_kv_step(
+        self,
+        step_token_ids: torch.Tensor,
+        step_positions: torch.Tensor,
+        prefix_len: int,
+        prefix_attention_mask: Optional[torch.Tensor],
+        past_key_values: DynamicCache,
+        past_image_len: int,
+    ) -> Tuple[torch.Tensor, DynamicCache]:
+        batch_size = int(step_token_ids.size(0))
+        current_len = int(step_token_ids.size(1))
+        if self._backbone_uses_flash_attention_2():
+            attention_mask = self._build_kv_attention_mask_2d(
+                batch_size=batch_size,
+                current_len=current_len,
+                past_len=past_image_len,
+                device=step_token_ids.device,
+                prefix_attention_mask=prefix_attention_mask,
+            )
+        else:
+            mask_dtype = next(self.backbone.parameters()).dtype
+            attention_mask = self._build_kv_attention_mask(
+                batch_size=batch_size,
+                current_len=current_len,
+                past_len=past_image_len,
+                device=step_token_ids.device,
+                dtype=mask_dtype,
+                prefix_attention_mask=prefix_attention_mask,
+            )
+        position_ids = (
+            step_positions.to(device=step_token_ids.device, dtype=torch.long)
+            + int(prefix_len)
+        ).unsqueeze(0).expand(batch_size, -1)
+        with self._temporary_backbone_non_causal():
+            outputs = self.backbone(
+                input_ids=step_token_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=True,
+                return_dict=True,
+            )
+        return outputs.last_hidden_state, outputs.past_key_values
+
+    def _append_vertical_kv_step(
+        self,
+        step_hidden: torch.Tensor,
+        step_positions: torch.Tensor,
+        prefix_len: int,
+        past_key_values: Optional[DynamicCache],
+        past_image_len: int,
+    ) -> Tuple[torch.Tensor, Optional[DynamicCache]]:
+        if self.vertical_block is None:
+            return step_hidden, past_key_values
+
+        cache = past_key_values if past_key_values is not None else DynamicCache()
+        batch_size = int(step_hidden.size(0))
+        current_len = int(step_hidden.size(1))
+        if self._vertical_uses_flash_attention_2():
+            attention_mask = None
+        else:
+            attention_mask = self._build_kv_attention_mask(
+                batch_size=batch_size,
+                current_len=current_len,
+                past_len=past_image_len,
+                device=step_hidden.device,
+                dtype=step_hidden.dtype,
+            )
+        position_ids = (
+            step_positions.to(device=step_hidden.device, dtype=torch.long)
+            + int(prefix_len)
+        ).unsqueeze(0).expand(batch_size, -1)
+        v_hidden = step_hidden
+        for layer in self.vertical_block:
+            layer_outputs = layer(
+                hidden_states=v_hidden,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=cache,
+                output_attentions=False,
+                use_cache=True,
+            )
+            v_hidden = layer_outputs[0]
+            cache = layer_outputs[1]
+        return self.vertical_norm(v_hidden), cache
+
+    def _compute_step_logits_from_prev(
+        self,
+        cond_hidden: torch.Tensor,
+        prev_h_hidden: Optional[torch.Tensor],
+        prev_v_hidden: Optional[torch.Tensor],
+        step_positions: torch.Tensor,
+        prev_positions: torch.Tensor,
+        height: int,
+        width: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        batch_size = int(cond_hidden.size(0))
+        cond_h_logits = self.horizontal_head(cond_hidden)
+        cond_v_logits = self.vertical_head(cond_hidden)
+        step_logits = torch.empty(
+            (batch_size, step_positions.numel(), self.vocab_size),
+            device=device,
+            dtype=cond_h_logits.dtype,
+        )
+
+        rows = step_positions // width
+        cols = step_positions % width
+        left_mask = cols > 0
+        up_mask = rows > 0
+        both_mask = left_mask & up_mask
+        corner_mask = ~left_mask & ~up_mask
+        h_only = left_mask & ~up_mask
+        v_only = up_mask & ~left_mask
+
+        if prev_h_hidden is not None and prev_v_hidden is not None and prev_positions.numel() > 0:
+            h_prev = self.horizontal_head(prev_h_hidden)
+            v_prev = self.vertical_head(prev_v_hidden)
+            total = int(height * width)
+            pos_to_idx = torch.full((total,), -1, device=device, dtype=torch.long)
+            pos_to_idx[prev_positions] = torch.arange(prev_positions.numel(), device=device)
+
+            if h_only.any():
+                left_idx = pos_to_idx[step_positions[h_only] - 1]
+                step_logits[:, h_only, :] = h_prev[:, left_idx, :]
+
+            if v_only.any():
+                up_idx = pos_to_idx[step_positions[v_only] - width]
+                step_logits[:, v_only, :] = v_prev[:, up_idx, :]
+
+            if both_mask.any():
+                left_idx = pos_to_idx[step_positions[both_mask] - 1]
+                up_idx = pos_to_idx[step_positions[both_mask] - width]
+                rw = self._hv_gate_from_pair(
+                    prev_h_hidden[:, left_idx, :],
+                    prev_v_hidden[:, up_idx, :],
+                    out_dtype=h_prev.dtype,
+                )
+                step_logits[:, both_mask, :] = (
+                    rw * h_prev[:, left_idx, :] + (1.0 - rw) * v_prev[:, up_idx, :]
+                )
+        elif h_only.any() or v_only.any() or both_mask.any():
+            raise RuntimeError("Previous diagonal hidden states are missing for non-corner prediction.")
+
+        if corner_mask.any():
+            rw_corner = self._hv_gate_corner(cond_hidden, out_dtype=cond_h_logits.dtype)
+            cond_logits = (
+                rw_corner * cond_h_logits[:, :1, :]
+                + (1.0 - rw_corner) * cond_v_logits[:, :1, :]
+            )
+            step_logits[:, corner_mask, :] = cond_logits.expand(
+                -1, int(corner_mask.sum().item()), -1
+            )
+        return step_logits
+
+    def _generate_without_kv_cache(
+        self,
+        *,
+        height: int,
+        width: int,
+        device: torch.device,
+        text_input_ids: Optional[torch.Tensor],
+        text_attention_mask: Optional[torch.Tensor],
+        unconditional_text_input_ids: Optional[torch.Tensor],
+        unconditional_text_attention_mask: Optional[torch.Tensor],
+        cfg_scale: float,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        sample_logits: bool,
+    ) -> torch.Tensor:
+        grid = torch.full(
+            (1, height, width), self.mask_token_id, device=device, dtype=torch.long
+        )
+        step_id = _build_step_id(height, width, device)
+        max_step = int(step_id.max().item())
+        use_cfg = cfg_scale > 1.0 and unconditional_text_input_ids is not None
+        cfg_text_input_ids = None
+        cfg_text_attention_mask = None
+        if use_cfg:
+            if text_input_ids is None:
+                raise ValueError("CFG requires text_input_ids for the conditional branch.")
+            cfg_text_input_ids, cfg_text_attention_mask = self._build_cfg_text_batch(
+                text_input_ids,
+                text_attention_mask,
+                unconditional_text_input_ids,
+                unconditional_text_attention_mask,
+            )
+
+        for step in range(0, max_step + 1):
+            positions = (step_id == step).nonzero(as_tuple=False).view(-1)
+            if positions.numel() == 0:
+                continue
+
+            image_ids = grid.view(1, -1)
+            prev_positions = (
+                positions
+                if step == 0
+                else (step_id == (step - 1)).nonzero(as_tuple=False).view(-1)
+            )
+            positions = positions.to(device=device, dtype=torch.long)
+            prev_positions = prev_positions.to(device=device, dtype=torch.long)
+
+            if use_cfg:
+                cfg_outputs = self(
+                    input_ids=torch.cat([image_ids, image_ids], dim=0),
+                    height=height,
+                    width=width,
+                    text_input_ids=cfg_text_input_ids,
+                    text_attention_mask=cfg_text_attention_mask,
+                    step_positions=positions,
+                    prev_positions=prev_positions,
+                )
+                u_step_logits, c_step_logits = cfg_outputs["step_logits"].chunk(2, dim=0)
+                step_logits = (
+                    u_step_logits + cfg_scale * (c_step_logits - u_step_logits)
+                )
+            else:
+                outputs = self(
+                    input_ids=image_ids,
+                    height=height,
+                    width=width,
+                    text_input_ids=text_input_ids,
+                    text_attention_mask=text_attention_mask,
+                    step_positions=positions,
+                    prev_positions=prev_positions,
+                )
+                step_logits = outputs["step_logits"]
+
+            if self.visual_token_offset is not None:
+                step_logits = step_logits.clone()
+                step_logits[:, :, : self.visual_token_offset] = float("-inf")
+
+            step_pred = _sample_logits(
+                step_logits,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                sample_logits=sample_logits,
+            )
+            grid.view(1, -1)[:, positions] = step_pred
+        return grid[0]
+
+    def _generate_with_kv_cache(
+        self,
+        *,
+        height: int,
+        width: int,
+        device: torch.device,
+        text_input_ids: torch.Tensor,
+        text_attention_mask: Optional[torch.Tensor],
+        unconditional_text_input_ids: Optional[torch.Tensor],
+        unconditional_text_attention_mask: Optional[torch.Tensor],
+        cfg_scale: float,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        sample_logits: bool,
+    ) -> torch.Tensor:
+        step_id = _build_step_id(height, width, device)
+        max_step = int(step_id.max().item())
+        grid = torch.full(
+            (1, height, width), self.mask_token_id, device=device, dtype=torch.long
+        )
+
+        text_input_ids, text_attention_mask = self._normalize_text_batch(
+            text_input_ids,
+            text_attention_mask,
+        )
+        if text_input_ids is None or text_attention_mask is None:
+            raise ValueError("KV-cache generation requires text_input_ids.")
+
+        use_cfg = cfg_scale > 1.0 and unconditional_text_input_ids is not None
+        if use_cfg:
+            kv_text_ids, kv_text_mask = self._build_cfg_text_batch(
+                text_input_ids,
+                text_attention_mask,
+                unconditional_text_input_ids,
+                unconditional_text_attention_mask,
+            )
+        else:
+            kv_text_ids, kv_text_mask = text_input_ids, text_attention_mask
+
+        cond_hidden, backbone_cache, prefix_len, prefix_mask = self._prefill_generation_prefix(
+            kv_text_ids,
+            kv_text_mask,
+        )
+
+        batch_size = int(kv_text_ids.size(0))
+        vertical_cache = DynamicCache() if self.vertical_block is not None else None
+        past_image_len = 0
+        prev_positions = torch.empty((0,), device=device, dtype=torch.long)
+        prev_h_hidden = None
+        prev_v_hidden = None
+
+        for step in range(0, max_step + 1):
+            step_positions = (step_id == step).nonzero(as_tuple=False).view(-1).to(
+                device=device, dtype=torch.long
+            )
+            if step_positions.numel() == 0:
+                continue
+
+            branch_step_logits = self._compute_step_logits_from_prev(
+                cond_hidden=cond_hidden,
+                prev_h_hidden=prev_h_hidden,
+                prev_v_hidden=prev_v_hidden,
+                step_positions=step_positions,
+                prev_positions=prev_positions,
+                height=height,
+                width=width,
+                device=device,
+            )
+
+            if use_cfg:
+                u_step_logits, c_step_logits = branch_step_logits.chunk(2, dim=0)
+                step_logits = u_step_logits + cfg_scale * (c_step_logits - u_step_logits)
+            else:
+                step_logits = branch_step_logits
+
+            if self.visual_token_offset is not None:
+                step_logits = step_logits.clone()
+                step_logits[:, :, : self.visual_token_offset] = float("-inf")
+
+            step_pred = _sample_logits(
+                step_logits,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                sample_logits=sample_logits,
+            )
+            grid.view(1, -1)[:, step_positions] = step_pred
+
+            step_token_ids = step_pred.expand(batch_size, -1).contiguous()
+            current_h_hidden, backbone_cache = self._append_backbone_kv_step(
+                step_token_ids=step_token_ids,
+                step_positions=step_positions,
+                prefix_len=prefix_len,
+                prefix_attention_mask=prefix_mask,
+                past_key_values=backbone_cache,
+                past_image_len=past_image_len,
+            )
+            current_v_hidden, vertical_cache = self._append_vertical_kv_step(
+                step_hidden=current_h_hidden,
+                step_positions=step_positions,
+                prefix_len=prefix_len,
+                past_key_values=vertical_cache,
+                past_image_len=past_image_len,
+            )
+
+            prev_positions = step_positions
+            prev_h_hidden = current_h_hidden
+            prev_v_hidden = current_v_hidden
+            past_image_len += int(step_positions.numel())
+        return grid[0]
+
     # ------------------------------------------------------------------
     # Generation
     # ------------------------------------------------------------------
@@ -974,6 +1516,7 @@ class EmuNAR(nn.Module):
         top_k: int = 0,
         top_p: float = 1.0,
         sample_logits: bool = True,
+        use_kv_cache: bool = True,
     ) -> torch.Tensor:
         """
         Diagonal-step decoding.
@@ -981,68 +1524,43 @@ class EmuNAR(nn.Module):
         Returns:
             (H, W) int64 token grid.
         """
-        grid = torch.full(
-            (1, height, width), self.mask_token_id, device=device, dtype=torch.long
-        )
-        step_id = _build_step_id(height, width, device)
-        max_step = int(step_id.max().item())
-
-        for step in range(0, max_step + 1):
-            positions = (step_id == step).nonzero(as_tuple=False).view(-1)
-            if positions.numel() == 0:
-                continue
-
-            image_ids = grid.view(1, -1)
-            prev_positions = (
-                positions
-                if step == 0
-                else (step_id == (step - 1)).nonzero(as_tuple=False).view(-1)
+        if (
+            not use_kv_cache
+            and self._backbone_uses_flash_attention_2()
+        ):
+            raise ValueError(
+                "flash_attention_2 is currently supported only for KV-cache generation in EmuNAR. "
+                "Please set use_kv_cache=True."
             )
-            positions = positions.to(device=device, dtype=torch.long)
-            prev_positions = prev_positions.to(device=device, dtype=torch.long)
-
-            outputs = self(
-                input_ids=image_ids,
+        if use_kv_cache and text_input_ids is not None:
+            return self._generate_with_kv_cache(
                 height=height,
                 width=width,
+                device=device,
                 text_input_ids=text_input_ids,
                 text_attention_mask=text_attention_mask,
-                step_positions=positions,
-                prev_positions=prev_positions,
-            )
-            step_logits = outputs["step_logits"]
-
-            # classifier-free guidance
-            if cfg_scale > 1.0 and unconditional_text_input_ids is not None:
-                u_outputs = self(
-                    input_ids=image_ids,
-                    height=height,
-                    width=width,
-                    text_input_ids=unconditional_text_input_ids,
-                    text_attention_mask=unconditional_text_attention_mask,
-                    step_positions=positions,
-                    prev_positions=prev_positions,
-                )
-                u_step_logits = u_outputs["step_logits"]
-                step_logits = (
-                    u_step_logits + cfg_scale * (step_logits - u_step_logits)
-                )
-
-            # mask non-visual tokens
-            if self.visual_token_offset is not None:
-                step_logits = step_logits.clone()
-                step_logits[:, :, : self.visual_token_offset] = float("-inf")
-
-            step_pred = _sample_logits(
-                step_logits,
+                unconditional_text_input_ids=unconditional_text_input_ids,
+                unconditional_text_attention_mask=unconditional_text_attention_mask,
+                cfg_scale=cfg_scale,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
                 sample_logits=sample_logits,
             )
-            grid.view(1, -1)[:, positions] = step_pred
-
-        return grid[0]
+        return self._generate_without_kv_cache(
+            height=height,
+            width=width,
+            device=device,
+            text_input_ids=text_input_ids,
+            text_attention_mask=text_attention_mask,
+            unconditional_text_input_ids=unconditional_text_input_ids,
+            unconditional_text_attention_mask=unconditional_text_attention_mask,
+            cfg_scale=cfg_scale,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            sample_logits=sample_logits,
+        )
 
 
 __all__ = [
