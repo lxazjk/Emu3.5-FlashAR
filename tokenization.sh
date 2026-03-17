@@ -1,4 +1,4 @@
-torchrun --standalone --nproc_per_node=8 pretokenize_tar.py \
+torchrun --standalone --nproc_per_node=8 emu_nar/data/pretokenize_tar.py \
   --json_path "/opt/tiger/Emu3.5-NAR/GPT4o-Image/text_to_image.json" \
   --image_root "/opt/tiger/Emu3.5-NAR/GPT4o-Image" \
   --output_dir "/opt/tiger/Emu3.5-NAR/GPT4o-Image_pretok_32" \
