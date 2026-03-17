@@ -31,7 +31,7 @@ nar_ckpt_path = os.getenv(
 )
 nar_use_vertical_block = True
 nar_vertical_layers = _env_int("EMU35_NAR_VERTICAL_LAYERS", 2)
-nar_attn_implementation = os.getenv("EMU35_NAR_ATTN_IMPL", "flex_attention")
+nar_attn_implementation = os.getenv("EMU35_NAR_ATTN_IMPL", "eager")
 nar_merge_dtype = os.getenv("EMU35_NAR_MERGE_DTYPE", "bf16")
 nar_fsdp_wrap_policy = os.getenv("EMU35_NAR_FSDP_WRAP_POLICY", "transformer")
 nar_fsdp_min_params = _env_int("EMU35_NAR_FSDP_MIN_PARAMS", 1_000_000)
