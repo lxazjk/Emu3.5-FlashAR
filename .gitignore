@@ -57,6 +57,7 @@ _trash/
 ### Notes
 emu*.md
 output_image/
+*log*
 ### Dataset
 Infinity-MM/
 GPT4o-Image/
