@@ -64,3 +64,5 @@ GPT4o-Image/
 # GPT4o-Image_pretok_32/
 
 .*
+*.png
+wandb/
