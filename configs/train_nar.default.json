@@ -45,7 +45,7 @@
   },
   "optimization": {
     "epochs": 20,
-    "max_steps": 500000,
+    "max_steps": 20000,
     "lr": 5e-05,
     "backbone_lr": 0.0,
     "backbone_lr_factor": 0.2,
