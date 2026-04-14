@@ -20,7 +20,7 @@
     "add_boi": true,
     "seed": 1234,
     "batch_size": 1,
-    "num_workers": 0,
+    "num_workers": 16,
     "shuffle": true
   },
   "runtime": {
@@ -41,7 +41,8 @@
     "visual_token_offset": -1,
     "visual_vocab_size": 131072,
     "use_vertical_block": true,
-    "vertical_layers": 2
+    "vertical_layers": 4,
+    "vertical_start_layer": -1
   },
   "optimization": {
     "epochs": 20,
@@ -50,9 +51,9 @@
     "backbone_lr": 0.0,
     "backbone_lr_factor": 0.2,
     "grad_clip": 0.0,
-    "grad_accum_steps": 2,
+    "grad_accum_steps": 1,
     "train_backbone": true,
-    "vertical_head_warmup_steps": 1200,
+    "vertical_head_warmup_steps": 1000,
     "ar_distill_weight": 0.2,
     "ar_distill_temperature": 2.0,
     "phase2_lr_factor": 0.35,
@@ -67,9 +68,10 @@
   "checkpointing": {
     "fresh_run": false,
     "save_latest_only": true,
-    "save_every_steps": 2000,
+    "save_every_steps": 200,
     "save_full_state": true,
-    "save_epoch": "full"
+    "save_epoch": "full",
+    "hf_max_shard_size": "5GB"
   },
   "eval": {
     "eval_generate_prompt": "A futuristic cyberpunk city street during heavy rain at night. Neon signs in pink and cyan reflect on the wet pavement. A lone samurai with a glowing katana stands in the foreground, wearing a high-tech armored trench coat. Towering skyscrapers disappear into the mist above. Cinematic composition, dramatic lighting, ray tracing, highly detailed, photorealistic, 8k resolution, cyberpunk aesthetic, Blade Runner style, sharp focus, volumetric lighting.",

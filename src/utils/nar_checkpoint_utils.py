@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import glob
+import json
 import os.path as osp
 import re
 from typing import Any, Dict, Tuple
 
 import torch
+from safetensors.torch import load_file as safe_load_file
 
 
 _FUSE_COMPAT_TOKENS = (
@@ -16,9 +18,12 @@ _FUSE_COMPAT_TOKENS = (
     "horizontal_head.bias",
     "vertical_head.bias",
 )
+_HF_MODEL_FILENAMES = ("model.safetensors", "pytorch_model.bin")
+_HF_MODEL_INDEX_FILENAMES = ("model.safetensors.index.json", "pytorch_model.bin.index.json")
+_HF_SHARD_FILENAME_RE = re.compile(r"^(?:model|pytorch_model)-\d{5}-of-\d{5}\.(?:safetensors|bin)$")
 
 
-def safe_torch_load(path: str, *, mmap: bool = False):
+def _torch_load_cpu(path: str, *, mmap: bool = False):
     load_kwargs = {
         "map_location": "cpu",
         "weights_only": False,
@@ -34,6 +39,60 @@ def safe_torch_load(path: str, *, mmap: bool = False):
         except TypeError:
             load_kwargs.pop("weights_only", None)
             return torch.load(path, **load_kwargs)
+
+
+def _load_sharded_hf_state(index_path: str, *, mmap: bool = False):
+    with open(index_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    weight_map = payload.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError(f"Invalid HF shard index at {index_path}: missing weight_map")
+    base_dir = osp.dirname(index_path)
+    state_dict = {}
+    for shard_name in sorted(set(str(name) for name in weight_map.values())):
+        shard_path = osp.join(base_dir, shard_name)
+        if not osp.exists(shard_path):
+            raise FileNotFoundError(f"Missing shard referenced by {index_path}: {shard_path}")
+        if shard_name.endswith(".safetensors"):
+            shard_state = safe_load_file(shard_path, device="cpu")
+        else:
+            shard_state = _torch_load_cpu(shard_path, mmap=mmap)
+        state_dict.update(shard_state)
+    return state_dict
+
+
+def safe_torch_load(path: str, *, mmap: bool = False):
+    if (not osp.exists(path)) and path.endswith(".pt") and osp.isdir(path[:-3]):
+        path = path[:-3]
+    if path.endswith(".index.json"):
+        return _load_sharded_hf_state(path, mmap=mmap)
+    if _HF_SHARD_FILENAME_RE.fullmatch(osp.basename(path)) is not None:
+        for index_name in _HF_MODEL_INDEX_FILENAMES:
+            index_path = osp.join(osp.dirname(path), index_name)
+            if osp.exists(index_path):
+                return _load_sharded_hf_state(index_path, mmap=mmap)
+    if path.endswith(".safetensors"):
+        return safe_load_file(path, device="cpu")
+    if osp.isdir(path):
+        safetensor_index_path = osp.join(path, "model.safetensors.index.json")
+        if osp.exists(safetensor_index_path):
+            return _load_sharded_hf_state(safetensor_index_path, mmap=mmap)
+        bin_index_path = osp.join(path, "pytorch_model.bin.index.json")
+        if osp.exists(bin_index_path):
+            return _load_sharded_hf_state(bin_index_path, mmap=mmap)
+        safetensor_path = osp.join(path, "model.safetensors")
+        if osp.exists(safetensor_path):
+            return safe_load_file(safetensor_path, device="cpu")
+        bin_path = osp.join(path, "pytorch_model.bin")
+        if osp.exists(bin_path):
+            path = bin_path
+        else:
+            raise FileNotFoundError(
+                f"Unsupported HF checkpoint directory: {path}. "
+                "Expected model.safetensors, model.safetensors.index.json, "
+                "or pytorch_model.bin."
+            )
+    return _torch_load_cpu(path, mmap=mmap)
 
 
 def strip_shard_suffix(path: str) -> str:
@@ -60,6 +119,23 @@ def infer_vertical_from_state(state_dict: Dict[str, Any]) -> Tuple[bool, int]:
     if has_vertical_norm:
         return True, 1
     return False, 0
+
+
+def load_nar_metadata(path: str) -> Dict[str, Any]:
+    path = strip_shard_suffix(str(path))
+    if (not osp.exists(path)) and path.endswith(".pt") and osp.isdir(path[:-3]):
+        path = path[:-3]
+    if not osp.isdir(path):
+        return {}
+    cfg_path = osp.join(path, "config.json")
+    if not osp.exists(cfg_path):
+        return {}
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def load_state_with_allowed_missing(
@@ -126,11 +202,6 @@ def resolve_nar_ckpt_path(
     fsdp_min_params: int = 1_000_000,
     use_vertical_block: bool | None = None,
     vertical_layers: int = 0,
-    lora_layers: int = 0,
-    lora_r: int = 0,
-    lora_alpha: float | None = None,
-    lora_dropout: float = 0.0,
-    merge_script_path: str = "",
 ) -> str:
     del model_path
     del merge_dtype
@@ -138,17 +209,14 @@ def resolve_nar_ckpt_path(
     del fsdp_min_params
     del use_vertical_block
     del vertical_layers
-    del lora_layers
-    del lora_r
-    del lora_alpha
-    del lora_dropout
-    del merge_script_path
     if not nar_ckpt_path:
         raise ValueError("nar_ckpt_path is required for NAR inference loading.")
     nar_ckpt_path = strip_shard_suffix(nar_ckpt_path)
 
     if osp.exists(nar_ckpt_path):
         return nar_ckpt_path
+    if nar_ckpt_path.endswith(".pt") and osp.isdir(nar_ckpt_path[:-3]):
+        return nar_ckpt_path[:-3]
 
     if nar_ckpt_path.endswith(".pt"):
         full_candidate = nar_ckpt_path[:-3] + ".full.pt"

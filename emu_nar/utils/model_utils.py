@@ -141,17 +141,21 @@ def build_wrapper(
     vertical_layers = args.vertical_layers
     if vertical_layers <= 0:
         vertical_layers = int(getattr(model_config, "nar_vertical_layers", 1))
+    vertical_start_layer = int(getattr(args, "vertical_start_layer", -1))
+    if vertical_start_layer < 0:
+        vertical_start_layer = int(getattr(model_config, "nar_vertical_start_layer", -1))
     wrapper = EmuNAR(
         pretrained_backbone=backbone.model,
         vocab_size=model_config.vocab_size,
         hidden_size=model_config.hidden_size,
-        num_heads=model_config.num_attention_heads,
         pad_token_id=-100,
         mask_token_id=model_config.pad_token_id,
         visual_token_offset=visual_token_offset,
         use_vertical_block=args.use_vertical_block,
         vertical_layers=vertical_layers,
+        vertical_start_layer=vertical_start_layer,
         lm_head=backbone.lm_head,
+        split_backbone=getattr(args, "split_backbone", False),
     )
     if args.fsdp:
         wrapper = wrapper.to(dtype=torch_dtype)

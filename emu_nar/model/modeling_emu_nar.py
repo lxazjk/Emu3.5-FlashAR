@@ -206,8 +206,9 @@ class EmuNAR(nn.Module):
     Wrap an AR backbone for NAR training and diagonal-step decoding.
 
     Architecture:
-        backbone  →  hidden states  →  horizontal_head  →  h_logits (right neighbor)
-                                    →  [vertical_block] → vertical_head → v_logits (down neighbor)
+        backbone[:vertical_start_layer]      → shared hidden
+        backbone[vertical_start_layer:]      → horizontal_head → h_logits (right neighbor)
+        [vertical_block from same split]     → vertical_head   → v_logits (down neighbor)
         fused_logits = shift-and-merge(h_logits, v_logits)
     """
 
@@ -216,18 +217,15 @@ class EmuNAR(nn.Module):
         pretrained_backbone: nn.Module,
         vocab_size: int,
         hidden_size: int,
-        num_heads: int = 8,
-        ff_mult: int = 4,
-        dropout: float = 0.1,
         pad_token_id: int = -100,
         mask_token_id: Optional[int] = None,
         visual_token_offset: Optional[int] = None,
         use_vertical_block: bool = True,
         vertical_layers: int = 1,
+        vertical_start_layer: int = -1,
         learnable_fuse: bool = False,
-        fuse_h_init: float = 0.5,
-        fuse_corner_h_init: float = -1.0,
         lm_head: Optional[nn.Linear] = None,
+        split_backbone: bool = False,
     ) -> None:
         super().__init__()
         self.backbone = pretrained_backbone
@@ -239,25 +237,46 @@ class EmuNAR(nn.Module):
         )
         self.visual_token_offset = visual_token_offset
         self.use_vertical_block = use_vertical_block
-        # Kept for backward-compatible constructor arguments; fusion now uses hv_gate.
         self.learnable_fuse = bool(learnable_fuse)
 
         cfg = getattr(pretrained_backbone, "config", None)
+        backbone_layers = getattr(pretrained_backbone, "layers", None)
+        self.backbone_num_layers = int(len(backbone_layers)) if backbone_layers is not None else 0
+        self.vertical_layers = max(1, int(vertical_layers)) if use_vertical_block else 0
+        self.vertical_start_layer = self.backbone_num_layers
+        if use_vertical_block:
+            if backbone_layers is None or self.backbone_num_layers <= 0:
+                raise ValueError("pretrained_backbone.layers is required for vertical_block.")
+            if vertical_start_layer < 0:
+                vertical_start_layer = self.backbone_num_layers - self.vertical_layers
+            self.vertical_start_layer = int(vertical_start_layer)
+            if self.vertical_start_layer < 0:
+                raise ValueError(
+                    f"vertical_start_layer must be >= 0, got {self.vertical_start_layer}."
+                )
+            if self.vertical_start_layer + self.vertical_layers > self.backbone_num_layers:
+                raise ValueError(
+                    "vertical_start_layer + vertical_layers exceeds backbone depth. "
+                    f"start={self.vertical_start_layer} layers={self.vertical_layers} "
+                    f"backbone_num_layers={self.backbone_num_layers}."
+                )
+
+        self.split_backbone = bool(split_backbone) and use_vertical_block and (
+            self.vertical_start_layer < self.backbone_num_layers
+        )
 
         # --- prediction heads ---
         self.horizontal_head = nn.Linear(hidden_size, vocab_size, bias=False)
 
         if use_vertical_block:
-            layers = max(1, int(vertical_layers))
-            backbone_layers = getattr(pretrained_backbone, "layers", None)
-            if backbone_layers is None or len(backbone_layers) < layers:
-                raise ValueError(
-                    "pretrained_backbone.layers is missing or shorter than vertical_layers; "
-                    "cannot initialize vertical block from Emu3 decoder layers."
-                )
             # Reuse Emu3.5 transformer parameters by cloning decoder layers from backbone.
             self.vertical_block = nn.ModuleList(
-                [copy.deepcopy(layer) for layer in backbone_layers[-layers:]]
+                [
+                    copy.deepcopy(layer)
+                    for layer in backbone_layers[
+                        self.vertical_start_layer : self.vertical_start_layer + self.vertical_layers
+                    ]
+                ]
             )
             for layer in self.vertical_block:
                 if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "is_causal"):
@@ -308,6 +327,13 @@ class EmuNAR(nn.Module):
         if self.vertical_norm is not None:
             self.vertical_norm.to(dtype=backbone_dtype)
         self.vertical_head.to(dtype=backbone_dtype)
+
+    def _vertical_capture_layer(self) -> Optional[int]:
+        if self.vertical_block is None:
+            return None
+        if self.vertical_start_layer >= self.backbone_num_layers:
+            return None
+        return int(self.vertical_start_layer)
 
     def _reshape_grid(
         self, seq: torch.Tensor, height: int, width: int
@@ -485,20 +511,22 @@ class EmuNAR(nn.Module):
 
     def _compute_logits(
         self,
-        cond_hidden: torch.Tensor,
-        image_hidden: torch.Tensor,
+        cond_horizontal_hidden: torch.Tensor,
+        cond_vertical_hidden: torch.Tensor,
+        horizontal_hidden: torch.Tensor,
+        vertical_input_hidden: torch.Tensor,
         height: int,
         width: int,
         step_mask_2d: torch.Tensor,
         position_offset: int = 0,
     ) -> Dict[str, torch.Tensor]:
-        cond_h_logits = self.horizontal_head(cond_hidden)
-        cond_v_logits = self.vertical_head(cond_hidden)
-        h_grid = self._reshape_grid(image_hidden, height, width)
+        cond_h_logits = self.horizontal_head(cond_horizontal_hidden)
+        cond_v_logits = self.vertical_head(cond_vertical_hidden)
+        h_grid = self._reshape_grid(horizontal_hidden, height, width)
         h_logits = self.horizontal_head(h_grid)
 
         v_hidden = self._apply_vertical_block(
-            image_hidden,
+            vertical_input_hidden,
             step_mask_2d,
             position_offset=position_offset,
         )
@@ -512,22 +540,83 @@ class EmuNAR(nn.Module):
             cond_v_logits,
             h_grid,
             v_grid,
-            cond_hidden,
+            cond_horizontal_hidden,
         )
         return {"fused": fused, "h_logits": h_logits, "v_logits": v_logits, **gate_stats}
+
+    def _run_backbone_remaining_layers(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run backbone layers [vertical_start_layer:] on already-computed hidden states."""
+        backbone_layers = self.backbone.layers
+        use_checkpoint = (
+            bool(getattr(self.backbone, "gradient_checkpointing", False))
+            and self.training
+        )
+        for layer_idx in range(self.vertical_start_layer, self.backbone_num_layers):
+            layer = backbone_layers[layer_idx]
+            if use_checkpoint:
+                layer_outputs = torch.utils.checkpoint.checkpoint(
+                    layer.__call__,
+                    hidden_states,
+                    attention_mask,
+                    position_ids,
+                    None,
+                    False,
+                    False,
+                    use_reentrant=False,
+                )
+            else:
+                layer_outputs = layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    output_attentions=False,
+                    use_cache=False,
+                )
+            hidden_states = layer_outputs[0]
+        hidden_states = self.backbone.norm(hidden_states)
+        return hidden_states
 
     def _run_backbone(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.split_backbone:
+            outputs = self.backbone(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                return_dict=True,
+                use_cache=False,
+                stop_after_layer=self.vertical_start_layer,
+            )
+            shared_hidden = outputs.last_hidden_state
+            last_hidden = self._run_backbone_remaining_layers(
+                shared_hidden, attention_mask,
+            )
+            return last_hidden, shared_hidden
+
+        capture_layer = self._vertical_capture_layer()
         outputs = self.backbone(
             input_ids=input_ids,
             attention_mask=attention_mask,
             return_dict=True,
             use_cache=False,
+            capture_hidden_before_layer=capture_layer,
         )
-        return outputs.last_hidden_state
+        last_hidden = outputs.last_hidden_state
+        vertical_input_hidden = (
+            outputs.captured_hidden_state if capture_layer is not None else last_hidden
+        )
+        if vertical_input_hidden is None:
+            raise RuntimeError(
+                "backbone did not return captured_hidden_state for vertical branch."
+            )
+        return last_hidden, vertical_input_hidden
 
     def _split_hidden_states(
         self,
@@ -691,9 +780,14 @@ class EmuNAR(nn.Module):
         )
 
         # --- backbone forward ---
-        hidden = self._run_backbone(full_input_ids, attn_mask)
-        cond_hidden, image_hidden = self._split_hidden_states(
+        hidden, vertical_input_hidden = self._run_backbone(full_input_ids, attn_mask)
+        cond_horizontal_hidden, image_hidden = self._split_hidden_states(
             hidden=hidden,
+            prefix_len=prefix_len,
+            text_attention_mask=text_attention_mask,
+        )
+        cond_vertical_hidden, vertical_image_hidden = self._split_hidden_states(
+            hidden=vertical_input_hidden,
             prefix_len=prefix_len,
             text_attention_mask=text_attention_mask,
         )
@@ -701,8 +795,10 @@ class EmuNAR(nn.Module):
         # === step-based generation path ===
         if step_positions is not None and prev_positions is not None:
             return self._forward_step(
-                cond_hidden,
+                cond_horizontal_hidden,
+                cond_vertical_hidden,
                 image_hidden,
+                vertical_image_hidden,
                 step_mask_2d,
                 step_positions,
                 prev_positions,
@@ -714,8 +810,10 @@ class EmuNAR(nn.Module):
 
         # === full loss path ===
         outputs = self._forward_full(
-            cond_hidden,
+            cond_horizontal_hidden,
+            cond_vertical_hidden,
             image_hidden,
+            vertical_image_hidden,
             step_mask_2d,
             input_ids,
             height,
@@ -742,8 +840,10 @@ class EmuNAR(nn.Module):
 
     def _forward_step(
         self,
-        cond_hidden: torch.Tensor,
-        image_hidden: torch.Tensor,
+        cond_horizontal_hidden: torch.Tensor,
+        cond_vertical_hidden: torch.Tensor,
+        horizontal_hidden: torch.Tensor,
+        vertical_input_hidden: torch.Tensor,
         step_mask_2d: torch.Tensor,
         step_positions: torch.Tensor,
         prev_positions: torch.Tensor,
@@ -753,7 +853,7 @@ class EmuNAR(nn.Module):
         position_offset: int = 0,
     ) -> Dict[str, torch.Tensor]:
         """Per-step logits for generation (no loss)."""
-        bsz = image_hidden.size(0)
+        bsz = horizontal_hidden.size(0)
         if step_positions.dim() != 1 or prev_positions.dim() != 1:
             raise ValueError("step_positions and prev_positions must be 1-D.")
         if step_positions.numel() == 0:
@@ -764,16 +864,16 @@ class EmuNAR(nn.Module):
             }
 
         v_hidden = self._apply_vertical_block(
-            image_hidden,
+            vertical_input_hidden,
             step_mask_2d,
             position_offset=position_offset,
         )
-        cond_h_logits = self.horizontal_head(cond_hidden)
-        cond_v_logits = self.vertical_head(cond_hidden)
+        cond_h_logits = self.horizontal_head(cond_horizontal_hidden)
+        cond_v_logits = self.vertical_head(cond_vertical_hidden)
 
-        h_prev = self.horizontal_head(image_hidden[:, prev_positions, :])
+        h_prev = self.horizontal_head(horizontal_hidden[:, prev_positions, :])
         v_prev = self.vertical_head(v_hidden[:, prev_positions, :])
-        h_prev_feat = image_hidden[:, prev_positions, :]
+        h_prev_feat = horizontal_hidden[:, prev_positions, :]
         v_prev_feat = v_hidden[:, prev_positions, :]
 
         total = height * width
@@ -822,7 +922,7 @@ class EmuNAR(nn.Module):
 
         # corner (0,0): per-sample corner gate
         if corner_mask.any():
-            rw_corner = self._hv_gate_corner(cond_hidden, out_dtype=h_prev.dtype)
+            rw_corner = self._hv_gate_corner(cond_horizontal_hidden, out_dtype=h_prev.dtype)
             cond_logits = rw_corner * cond_h_logits[:, :1, :] + (1.0 - rw_corner) * cond_v_logits[:, :1, :]
             step_logits[:, corner_mask, :] = cond_logits.expand(-1, int(corner_mask.sum().item()), -1)
 
@@ -830,8 +930,10 @@ class EmuNAR(nn.Module):
 
     def _forward_full(
         self,
-        cond_hidden: torch.Tensor,
-        image_hidden: torch.Tensor,
+        cond_horizontal_hidden: torch.Tensor,
+        cond_vertical_hidden: torch.Tensor,
+        horizontal_hidden: torch.Tensor,
+        vertical_input_hidden: torch.Tensor,
         step_mask_2d: torch.Tensor,
         input_ids: torch.Tensor,
         height: int,
@@ -843,8 +945,10 @@ class EmuNAR(nn.Module):
         bsz = input_ids.size(0)
         device = input_ids.device
         logits = self._compute_logits(
-            cond_hidden,
-            image_hidden,
+            cond_horizontal_hidden,
+            cond_vertical_hidden,
+            horizontal_hidden,
+            vertical_input_hidden,
             height,
             width,
             step_mask_2d,
@@ -931,7 +1035,7 @@ class EmuNAR(nn.Module):
             text_attention_mask=text_attention_mask,
         )
         with torch.no_grad():
-            ar_hidden = self._run_backbone(full_input_ids, ar_attn)
+            ar_hidden, _ = self._run_backbone(full_input_ids, ar_attn)
         ar_image_hidden = ar_hidden[:, prefix_len:, :] if prefix_len > 0 else ar_hidden
 
         # teacher at previous token predicts current target q in AR factorization.
@@ -1122,7 +1226,51 @@ class EmuNAR(nn.Module):
         self,
         text_input_ids: torch.Tensor,
         text_attention_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, DynamicCache, int, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, DynamicCache, int, torch.Tensor]:
+        if self.split_backbone:
+            shared_cache = DynamicCache()
+            shared_outputs = self.backbone(
+                input_ids=text_input_ids,
+                attention_mask=text_attention_mask,
+                past_key_values=shared_cache,
+                use_cache=True,
+                return_dict=True,
+                stop_after_layer=self.vertical_start_layer,
+            )
+            shared_hidden = shared_outputs.last_hidden_state
+            cond_vertical_hidden = self._gather_last_valid_hidden(
+                shared_hidden, text_attention_mask,
+            )
+            remaining_cache = DynamicCache()
+            batch_size, seq_len = text_input_ids.shape
+            position_ids = torch.arange(seq_len, device=text_input_ids.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+            h_hidden = shared_hidden
+            for layer_idx in range(self.vertical_start_layer, self.backbone_num_layers):
+                layer = self.backbone.layers[layer_idx]
+                layer_outputs = layer(
+                    h_hidden,
+                    attention_mask=text_attention_mask if text_attention_mask.dim() <= 2 else None,
+                    position_ids=position_ids,
+                    past_key_value=remaining_cache,
+                    output_attentions=False,
+                    use_cache=True,
+                )
+                h_hidden = layer_outputs[0]
+                remaining_cache = layer_outputs[1] if len(layer_outputs) > 1 else remaining_cache
+            h_hidden = self.backbone.norm(h_hidden)
+            cond_horizontal_hidden = self._gather_last_valid_hidden(
+                h_hidden, text_attention_mask,
+            )
+            combined_cache = self._merge_caches(shared_outputs.past_key_values, remaining_cache)
+            return (
+                cond_horizontal_hidden,
+                cond_vertical_hidden,
+                combined_cache,
+                int(text_input_ids.size(1)),
+                text_attention_mask,
+            )
+
+        capture_layer = self._vertical_capture_layer()
         prefix_cache = DynamicCache()
         outputs = self.backbone(
             input_ids=text_input_ids,
@@ -1130,17 +1278,43 @@ class EmuNAR(nn.Module):
             past_key_values=prefix_cache,
             use_cache=True,
             return_dict=True,
+            capture_hidden_before_layer=capture_layer,
         )
-        cond_hidden = self._gather_last_valid_hidden(
+        cond_horizontal_hidden = self._gather_last_valid_hidden(
             outputs.last_hidden_state,
             text_attention_mask,
         )
+        vertical_prefix_hidden = (
+            outputs.captured_hidden_state if capture_layer is not None else outputs.last_hidden_state
+        )
+        if vertical_prefix_hidden is None:
+            raise RuntimeError(
+                "backbone did not return captured_hidden_state for vertical prefix branch."
+            )
+        cond_vertical_hidden = self._gather_last_valid_hidden(
+            vertical_prefix_hidden,
+            text_attention_mask,
+        )
         return (
-            cond_hidden,
+            cond_horizontal_hidden,
+            cond_vertical_hidden,
             outputs.past_key_values,
             int(text_input_ids.size(1)),
             text_attention_mask,
         )
+
+    @staticmethod
+    def _merge_caches(cache_a: DynamicCache, cache_b: DynamicCache) -> DynamicCache:
+        """Merge two DynamicCaches (from shared layers and remaining layers) into one."""
+        merged = DynamicCache()
+        for layer_idx in range(len(cache_a)):
+            k, v = cache_a[layer_idx]
+            merged.update(k, v, layer_idx)
+        offset = len(cache_a)
+        for layer_idx in range(len(cache_b)):
+            k, v = cache_b[layer_idx]
+            merged.update(k, v, offset + layer_idx)
+        return merged
 
     def _append_backbone_kv_step(
         self,
@@ -1150,9 +1324,10 @@ class EmuNAR(nn.Module):
         prefix_attention_mask: Optional[torch.Tensor],
         past_key_values: DynamicCache,
         past_image_len: int,
-    ) -> Tuple[torch.Tensor, DynamicCache]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, DynamicCache]:
         batch_size = int(step_token_ids.size(0))
         current_len = int(step_token_ids.size(1))
+
         if self._backbone_uses_flash_attention_2():
             attention_mask = self._build_kv_attention_mask_2d(
                 batch_size=batch_size,
@@ -1175,6 +1350,57 @@ class EmuNAR(nn.Module):
             step_positions.to(device=step_token_ids.device, dtype=torch.long)
             + int(prefix_len)
         ).unsqueeze(0).expand(batch_size, -1)
+
+        if self.split_backbone:
+            with self._temporary_backbone_non_causal():
+                shared_outputs = self.backbone(
+                    input_ids=step_token_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    return_dict=True,
+                    stop_after_layer=self.vertical_start_layer,
+                )
+            shared_hidden = shared_outputs.last_hidden_state
+            remaining_cache = DynamicCache()
+            num_shared_layers = self.vertical_start_layer
+            for cache_layer_idx in range(num_shared_layers, len(past_key_values)):
+                k, v = past_key_values[cache_layer_idx]
+                remaining_cache.update(k, v, cache_layer_idx - num_shared_layers)
+
+            remaining_attn = self._build_kv_attention_mask(
+                batch_size=batch_size,
+                current_len=current_len,
+                past_len=past_image_len,
+                device=step_token_ids.device,
+                dtype=shared_hidden.dtype,
+                prefix_attention_mask=prefix_attention_mask,
+            ) if not self._backbone_uses_flash_attention_2() else attention_mask
+
+            h_hidden = shared_hidden
+            new_remaining_cache = DynamicCache()
+            for rel_idx, layer_idx in enumerate(range(self.vertical_start_layer, self.backbone_num_layers)):
+                layer = self.backbone.layers[layer_idx]
+                layer_past = DynamicCache()
+                if rel_idx < len(remaining_cache):
+                    k, v = remaining_cache[rel_idx]
+                    layer_past.update(k, v, 0)
+
+                layer_outputs = layer(
+                    h_hidden,
+                    attention_mask=remaining_attn,
+                    position_ids=position_ids,
+                    past_key_value=new_remaining_cache,
+                    output_attentions=False,
+                    use_cache=True,
+                )
+                h_hidden = layer_outputs[0]
+            h_hidden = self.backbone.norm(h_hidden)
+            merged_cache = self._merge_caches(shared_outputs.past_key_values, new_remaining_cache)
+            return h_hidden, shared_hidden, merged_cache
+
+        capture_layer = self._vertical_capture_layer()
         with self._temporary_backbone_non_causal():
             outputs = self.backbone(
                 input_ids=step_token_ids,
@@ -1183,8 +1409,17 @@ class EmuNAR(nn.Module):
                 past_key_values=past_key_values,
                 use_cache=True,
                 return_dict=True,
+                capture_hidden_before_layer=capture_layer,
             )
-        return outputs.last_hidden_state, outputs.past_key_values
+        current_h_hidden = outputs.last_hidden_state
+        current_v_input_hidden = (
+            outputs.captured_hidden_state if capture_layer is not None else current_h_hidden
+        )
+        if current_v_input_hidden is None:
+            raise RuntimeError(
+                "backbone did not return captured_hidden_state for vertical KV branch."
+            )
+        return current_h_hidden, current_v_input_hidden, outputs.past_key_values
 
     def _append_vertical_kv_step(
         self,
@@ -1230,7 +1465,8 @@ class EmuNAR(nn.Module):
 
     def _compute_step_logits_from_prev(
         self,
-        cond_hidden: torch.Tensor,
+        cond_horizontal_hidden: torch.Tensor,
+        cond_vertical_hidden: torch.Tensor,
         prev_h_hidden: Optional[torch.Tensor],
         prev_v_hidden: Optional[torch.Tensor],
         step_positions: torch.Tensor,
@@ -1239,9 +1475,9 @@ class EmuNAR(nn.Module):
         width: int,
         device: torch.device,
     ) -> torch.Tensor:
-        batch_size = int(cond_hidden.size(0))
-        cond_h_logits = self.horizontal_head(cond_hidden)
-        cond_v_logits = self.vertical_head(cond_hidden)
+        batch_size = int(cond_horizontal_hidden.size(0))
+        cond_h_logits = self.horizontal_head(cond_horizontal_hidden)
+        cond_v_logits = self.vertical_head(cond_vertical_hidden)
         step_logits = torch.empty(
             (batch_size, step_positions.numel(), self.vocab_size),
             device=device,
@@ -1287,7 +1523,7 @@ class EmuNAR(nn.Module):
             raise RuntimeError("Previous diagonal hidden states are missing for non-corner prediction.")
 
         if corner_mask.any():
-            rw_corner = self._hv_gate_corner(cond_hidden, out_dtype=cond_h_logits.dtype)
+            rw_corner = self._hv_gate_corner(cond_horizontal_hidden, out_dtype=cond_h_logits.dtype)
             cond_logits = (
                 rw_corner * cond_h_logits[:, :1, :]
                 + (1.0 - rw_corner) * cond_v_logits[:, :1, :]
@@ -1296,94 +1532,6 @@ class EmuNAR(nn.Module):
                 -1, int(corner_mask.sum().item()), -1
             )
         return step_logits
-
-    def _generate_without_kv_cache(
-        self,
-        *,
-        height: int,
-        width: int,
-        device: torch.device,
-        text_input_ids: Optional[torch.Tensor],
-        text_attention_mask: Optional[torch.Tensor],
-        unconditional_text_input_ids: Optional[torch.Tensor],
-        unconditional_text_attention_mask: Optional[torch.Tensor],
-        cfg_scale: float,
-        temperature: float,
-        top_k: int,
-        top_p: float,
-        sample_logits: bool,
-    ) -> torch.Tensor:
-        grid = torch.full(
-            (1, height, width), self.mask_token_id, device=device, dtype=torch.long
-        )
-        step_id = _build_step_id(height, width, device)
-        max_step = int(step_id.max().item())
-        use_cfg = cfg_scale > 1.0 and unconditional_text_input_ids is not None
-        cfg_text_input_ids = None
-        cfg_text_attention_mask = None
-        if use_cfg:
-            if text_input_ids is None:
-                raise ValueError("CFG requires text_input_ids for the conditional branch.")
-            cfg_text_input_ids, cfg_text_attention_mask = self._build_cfg_text_batch(
-                text_input_ids,
-                text_attention_mask,
-                unconditional_text_input_ids,
-                unconditional_text_attention_mask,
-            )
-
-        for step in range(0, max_step + 1):
-            positions = (step_id == step).nonzero(as_tuple=False).view(-1)
-            if positions.numel() == 0:
-                continue
-
-            image_ids = grid.view(1, -1)
-            prev_positions = (
-                positions
-                if step == 0
-                else (step_id == (step - 1)).nonzero(as_tuple=False).view(-1)
-            )
-            positions = positions.to(device=device, dtype=torch.long)
-            prev_positions = prev_positions.to(device=device, dtype=torch.long)
-
-            if use_cfg:
-                cfg_outputs = self(
-                    input_ids=torch.cat([image_ids, image_ids], dim=0),
-                    height=height,
-                    width=width,
-                    text_input_ids=cfg_text_input_ids,
-                    text_attention_mask=cfg_text_attention_mask,
-                    step_positions=positions,
-                    prev_positions=prev_positions,
-                )
-                u_step_logits, c_step_logits = cfg_outputs["step_logits"].chunk(2, dim=0)
-                step_logits = (
-                    u_step_logits + cfg_scale * (c_step_logits - u_step_logits)
-                )
-            else:
-                outputs = self(
-                    input_ids=image_ids,
-                    height=height,
-                    width=width,
-                    text_input_ids=text_input_ids,
-                    text_attention_mask=text_attention_mask,
-                    step_positions=positions,
-                    prev_positions=prev_positions,
-                )
-                step_logits = outputs["step_logits"]
-
-            if self.visual_token_offset is not None:
-                step_logits = step_logits.clone()
-                step_logits[:, :, : self.visual_token_offset] = float("-inf")
-
-            step_pred = _sample_logits(
-                step_logits,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                sample_logits=sample_logits,
-            )
-            grid.view(1, -1)[:, positions] = step_pred
-        return grid[0]
 
     def _generate_with_kv_cache(
         self,
@@ -1425,7 +1573,7 @@ class EmuNAR(nn.Module):
         else:
             kv_text_ids, kv_text_mask = text_input_ids, text_attention_mask
 
-        cond_hidden, backbone_cache, prefix_len, prefix_mask = self._prefill_generation_prefix(
+        cond_horizontal_hidden, cond_vertical_hidden, backbone_cache, prefix_len, prefix_mask = self._prefill_generation_prefix(
             kv_text_ids,
             kv_text_mask,
         )
@@ -1445,7 +1593,8 @@ class EmuNAR(nn.Module):
                 continue
 
             branch_step_logits = self._compute_step_logits_from_prev(
-                cond_hidden=cond_hidden,
+                cond_horizontal_hidden=cond_horizontal_hidden,
+                cond_vertical_hidden=cond_vertical_hidden,
                 prev_h_hidden=prev_h_hidden,
                 prev_v_hidden=prev_v_hidden,
                 step_positions=step_positions,
@@ -1475,7 +1624,7 @@ class EmuNAR(nn.Module):
             grid.view(1, -1)[:, step_positions] = step_pred
 
             step_token_ids = step_pred.expand(batch_size, -1).contiguous()
-            current_h_hidden, backbone_cache = self._append_backbone_kv_step(
+            current_h_hidden, current_v_input_hidden, backbone_cache = self._append_backbone_kv_step(
                 step_token_ids=step_token_ids,
                 step_positions=step_positions,
                 prefix_len=prefix_len,
@@ -1484,7 +1633,7 @@ class EmuNAR(nn.Module):
                 past_image_len=past_image_len,
             )
             current_v_hidden, vertical_cache = self._append_vertical_kv_step(
-                step_hidden=current_h_hidden,
+                step_hidden=current_v_input_hidden,
                 step_positions=step_positions,
                 prefix_len=prefix_len,
                 past_key_values=vertical_cache,
@@ -1516,7 +1665,6 @@ class EmuNAR(nn.Module):
         top_k: int = 0,
         top_p: float = 1.0,
         sample_logits: bool = True,
-        use_kv_cache: bool = True,
     ) -> torch.Tensor:
         """
         Diagonal-step decoding.
@@ -1524,30 +1672,11 @@ class EmuNAR(nn.Module):
         Returns:
             (H, W) int64 token grid.
         """
-        if (
-            not use_kv_cache
-            and self._backbone_uses_flash_attention_2()
-        ):
+        if text_input_ids is None:
             raise ValueError(
-                "flash_attention_2 is currently supported only for KV-cache generation in EmuNAR. "
-                "Please set use_kv_cache=True."
+                "EmuNAR.generate now requires text_input_ids and always uses KV-cache generation."
             )
-        if use_kv_cache and text_input_ids is not None:
-            return self._generate_with_kv_cache(
-                height=height,
-                width=width,
-                device=device,
-                text_input_ids=text_input_ids,
-                text_attention_mask=text_attention_mask,
-                unconditional_text_input_ids=unconditional_text_input_ids,
-                unconditional_text_attention_mask=unconditional_text_attention_mask,
-                cfg_scale=cfg_scale,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                sample_logits=sample_logits,
-            )
-        return self._generate_without_kv_cache(
+        return self._generate_with_kv_cache(
             height=height,
             width=width,
             device=device,

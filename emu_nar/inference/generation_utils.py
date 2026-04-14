@@ -19,6 +19,7 @@ from src.utils.generation_utils import multimodal_decode
 from src.utils.nar_checkpoint_utils import (
     infer_vertical_from_state as _infer_vertical_from_state,
     load_state_with_fuse_compat as _load_state_with_fuse_compat,
+    load_nar_metadata as _load_nar_metadata,
     resolve_nar_ckpt_path as _resolve_nar_ckpt_path,
     safe_torch_load as _safe_torch_load,
 )
@@ -64,13 +65,10 @@ def _get_nar_wrapper(cfg, model) -> EmuNAR:
         fsdp_min_params=int(getattr(cfg, "nar_fsdp_min_params", 1_000_000)),
         use_vertical_block=getattr(cfg, "nar_use_vertical_block", None),
         vertical_layers=int(getattr(cfg, "nar_vertical_layers", 0)),
-        lora_layers=int(getattr(cfg, "nar_lora_layers", 0)),
-        lora_r=int(getattr(cfg, "nar_lora_r", 0)),
-        lora_alpha=getattr(cfg, "nar_lora_alpha", None),
-        lora_dropout=float(getattr(cfg, "nar_lora_dropout", 0.0)),
     )
 
     state = _safe_torch_load(nar_ckpt_path)
+    nar_metadata = _load_nar_metadata(nar_ckpt_path)
     model_config = model.config
     visual_token_offset = int(model_config.eoi_token_id) + 1
     inferred_use_vertical, inferred_vertical_layers = _infer_vertical_from_state(state)
@@ -89,18 +87,26 @@ def _get_nar_wrapper(cfg, model) -> EmuNAR:
         vertical_layers = int(getattr(model_config, "nar_vertical_layers", 1))
     if use_vertical_block and vertical_layers <= 0:
         vertical_layers = 1
+    cfg_vertical_start_layer = int(getattr(cfg, "nar_vertical_start_layer", -1))
+    if cfg_vertical_start_layer >= 0:
+        vertical_start_layer = cfg_vertical_start_layer
+    elif "vertical_start_layer" in nar_metadata:
+        vertical_start_layer = int(nar_metadata["vertical_start_layer"])
+    else:
+        vertical_start_layer = int(getattr(model_config, "num_hidden_layers", 0))
 
     wrapper = EmuNAR(
         pretrained_backbone=model.model,
         vocab_size=model_config.vocab_size,
         hidden_size=model_config.hidden_size,
-        num_heads=model_config.num_attention_heads,
         pad_token_id=-100,
         mask_token_id=model_config.pad_token_id,
         visual_token_offset=visual_token_offset,
         use_vertical_block=use_vertical_block,
         vertical_layers=vertical_layers,
+        vertical_start_layer=vertical_start_layer,
         lm_head=model.lm_head,
+        split_backbone=bool(getattr(cfg, "nar_split_backbone", False)),
     )
     _load_state_with_fuse_compat(wrapper, state, load_desc="load NAR ckpt")
     wrapper = wrapper.to(next(model.parameters()).device)

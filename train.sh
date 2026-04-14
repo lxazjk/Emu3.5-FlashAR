@@ -1,12 +1,21 @@
+#!/usr/bin/env bash
 set -euo pipefail
 
+: "${PYTHON_BIN:=python3}"
 : "${TRAIN_CONFIG_JSON:=./configs/train_nar.default.json}"
 : "${EXTRA_ARGS:=}"
 
-python3 -m pip install --user tiktoken
+"${PYTHON_BIN}" - <<'PY'
+import importlib.util
+
+if importlib.util.find_spec("tiktoken") is None:
+    raise SystemExit(
+        "Missing dependency: tiktoken. Install project requirements before running train.sh."
+    )
+PY
 
 readarray -t LAUNCHER_CFG < <(
-  python3 - "${TRAIN_CONFIG_JSON}" <<'PY'
+  "${PYTHON_BIN}" - "${TRAIN_CONFIG_JSON}" <<'PY'
 import sys
 from emu_nar.utils.config_utils import load_launcher_config
 
@@ -27,11 +36,13 @@ echo "[INFO] train config: ${TRAIN_CONFIG_JSON}"
 echo "[INFO] launcher: nproc_per_node=${NPROC_PER_NODE} cuda_visible_devices=${CUDA_VISIBLE_DEVICES_CFG}"
 
 CMD=(torchrun)
-[ "${STANDALONE}" = "1" ] && CMD+=(--standalone)
+if [ "${STANDALONE}" = "1" ]; then
+  CMD+=(--standalone)
+fi
 CMD+=(--nproc_per_node="${NPROC_PER_NODE}" train_nar.py --config_json "${TRAIN_CONFIG_JSON}")
 
 if [ -n "${EXTRA_ARGS}" ]; then
-  EXTRA_ARR=(${EXTRA_ARGS})
+  read -r -a EXTRA_ARR <<< "${EXTRA_ARGS}"
   CMD+=("${EXTRA_ARR[@]}")
 fi
 

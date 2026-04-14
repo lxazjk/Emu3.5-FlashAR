@@ -1,47 +1,22 @@
 # -*- coding: utf-8 -*-
 
 import argparse
-import os.path as osp
 
 import torch
 from PIL import Image
-from transformers import AutoTokenizer
 
+from emu_nar.model import EmuNAR
+from emu_nar.utils.text_utils import (
+    build_image_prefix_tokens as _build_image_prefix_tokens,
+    build_text_tokenizer as _build_text_tokenizer,
+)
 from src.emu3p5 import Emu3Config, Emu3ForCausalLM
+from src.utils.nar_checkpoint_utils import (
+    infer_vertical_from_state,
+    load_nar_metadata,
+    safe_torch_load,
+)
 from src.vision_tokenizer import build_vision_tokenizer
-from emu_nar.modeling_emu_nar import EmuNAR
-from emu_nar.lora import apply_lora_to_backbone, apply_progressive_lora_to_backbone
-
-
-def _build_text_tokenizer(tokenizer_path: str):
-    tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_path,
-        special_tokens_file=osp.join(tokenizer_path, "emu3_vision_tokens.txt"),
-        trust_remote_code=True,
-    )
-    tokenizer.bos_token = "<|extra_203|>"
-    tokenizer.eos_token = "<|extra_204|>"
-    tokenizer.pad_token = "<|endoftext|>"
-    tokenizer.eol_token = "<|extra_200|>"
-    tokenizer.eof_token = "<|extra_201|>"
-    tokenizer.tms_token = "<|extra_202|>"
-    tokenizer.img_token = "<|image token|>"
-    tokenizer.boi_token = "<|image start|>"
-    tokenizer.eoi_token = "<|image end|>"
-    tokenizer.bss_token = "<|extra_100|>"
-    tokenizer.ess_token = "<|extra_101|>"
-    tokenizer.bog_token = "<|extra_60|>"
-    tokenizer.eog_token = "<|extra_61|>"
-    tokenizer.boc_token = "<|extra_50|>"
-    tokenizer.eoc_token = "<|extra_51|>"
-    return tokenizer
-
-
-def _build_image_prefix_tokens(tokenizer, height: int, width: int) -> list[int]:
-    boi_id = tokenizer.encode(tokenizer.boi_token, add_special_tokens=False)[0]
-    img_id = tokenizer.encode(tokenizer.img_token, add_special_tokens=False)[0]
-    hw_ids = tokenizer.encode(f"{height}*{width}", add_special_tokens=False)
-    return [boi_id, *hw_ids, img_id]
 
 
 def parse_args():
@@ -67,14 +42,17 @@ def parse_args():
     p.add_argument(
         "--use_vertical_block",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
     )
-    p.add_argument("--vertical_layers", type=int, default=1)
-    p.add_argument("--lora_layers", type=int, default=0)
-    p.add_argument("--lora_r", type=int, default=0)
-    p.add_argument("--lora_r_min", type=int, default=0)
-    p.add_argument("--lora_alpha", type=float, default=0.0)
-    p.add_argument("--lora_dropout", type=float, default=0.0)
+    p.add_argument("--vertical_layers", type=int, default=0)
+    p.add_argument(
+        "--vertical_start_layer",
+        type=int,
+        default=-1,
+        help="Backbone layer index where the vertical branch starts. <0 means auto.",
+    )
+    p.add_argument("--split_backbone", action="store_true",
+                   help="Split backbone at vertical_start_layer: shared layers first, then parallel H/V branches.")
     return p.parse_args()
 
 
@@ -92,53 +70,68 @@ def main():
         args.model_path, config=cfg, torch_dtype=torch_dtype, attn_implementation="eager"
     ).to(device)
 
-    if args.lora_r > 0 and args.lora_layers > 0:
-        if args.lora_r_min > 0:
-            alpha_scale = (args.lora_alpha if args.lora_alpha > 0 else float(args.lora_r)) / float(
-                args.lora_r
+    state = safe_torch_load(args.ckpt_path)
+    nar_metadata = load_nar_metadata(args.ckpt_path)
+    inferred_use_vertical_block, inferred_vertical_layers = infer_vertical_from_state(state)
+    use_vertical_block = (
+        bool(args.use_vertical_block)
+        if args.use_vertical_block is not None
+        else bool(nar_metadata.get("use_vertical_block", inferred_use_vertical_block))
+    )
+    vertical_layers = (
+        int(args.vertical_layers)
+        if int(args.vertical_layers) > 0
+        else int(
+            nar_metadata.get(
+                "vertical_layers",
+                inferred_vertical_layers if inferred_vertical_layers > 0 else (1 if use_vertical_block else 0),
             )
-            apply_progressive_lora_to_backbone(
-                backbone,
-                num_layers=args.lora_layers,
-                r_min=args.lora_r_min,
-                r_max=args.lora_r,
-                alpha_scale=alpha_scale,
-                dropout=args.lora_dropout,
-            )
-        else:
-            lora_alpha = args.lora_alpha if args.lora_alpha > 0 else float(args.lora_r)
-            apply_lora_to_backbone(
-                backbone,
-                num_layers=args.lora_layers,
-                r=args.lora_r,
-                alpha=lora_alpha,
-                dropout=args.lora_dropout,
-            )
+        )
+    )
+    if use_vertical_block and vertical_layers <= 0:
+        vertical_layers = 1
+    vertical_start_layer = (
+        int(args.vertical_start_layer)
+        if int(args.vertical_start_layer) >= 0
+        else (
+            int(nar_metadata["vertical_start_layer"])
+            if "vertical_start_layer" in nar_metadata
+            else int(cfg.num_hidden_layers)
+        )
+    )
 
     wrapper = EmuNAR(
         pretrained_backbone=backbone.model,
         vocab_size=cfg.vocab_size,
         hidden_size=cfg.hidden_size,
-        num_heads=cfg.num_attention_heads,
         pad_token_id=-100,
         mask_token_id=cfg.pad_token_id,
         visual_token_offset=visual_token_offset,
-        use_vertical_block=args.use_vertical_block,
-        vertical_layers=args.vertical_layers,
+        use_vertical_block=use_vertical_block,
+        vertical_layers=vertical_layers,
+        vertical_start_layer=vertical_start_layer,
+        split_backbone=args.split_backbone,
     ).to(device=device, dtype=torch_dtype)
 
-    state = torch.load(args.ckpt_path, map_location="cpu")
     wrapper.load_state_dict(state, strict=True)
     wrapper.eval()
 
+    tokenizer = None
     text_ids = None
-    if args.prompt:
+    prompt = args.text_template.replace("{text}", args.prompt)
+    should_build_prefix = bool(prompt) or args.add_boi
+    if should_build_prefix:
         tokenizer = _build_text_tokenizer(args.tokenizer_path)
-        prompt = args.text_template.replace("{text}", args.prompt)
-        text_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        prefix_ids = tokenizer.encode(prompt, add_special_tokens=False)
         if args.add_boi and hasattr(tokenizer, "boi_token"):
-            text_ids = list(text_ids) + _build_image_prefix_tokens(tokenizer, args.height, args.width)
-        text_ids = torch.tensor(text_ids, dtype=torch.long, device=device).unsqueeze(0)
+            prefix_ids = list(prefix_ids) + _build_image_prefix_tokens(tokenizer, args.height, args.width)
+        if prefix_ids:
+            text_ids = torch.tensor(prefix_ids, dtype=torch.long, device=device).unsqueeze(0)
+    if text_ids is None:
+        raise ValueError(
+            "NAR generation now requires a non-empty prefix for KV-cache decoding. "
+            "Provide --prompt, a non-empty --text_template, or --add_boi."
+        )
     
     with torch.no_grad():
         tokens = wrapper.generate(

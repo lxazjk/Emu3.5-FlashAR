@@ -25,6 +25,7 @@
 """ PyTorch Emu3 model."""
 import math
 import warnings
+from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -78,6 +79,11 @@ if is_torch_fx_available():
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "Emu3Config"
+
+
+@dataclass
+class BaseModelOutputWithPastAndCapture(BaseModelOutputWithPast):
+    captured_hidden_state: Optional[torch.FloatTensor] = None
 
 
 def _get_unpad_data(attention_mask):
@@ -1105,8 +1111,10 @@ class Emu3Model(Emu3PreTrainedModel):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        capture_hidden_before_layer: Optional[int] = None,
+        stop_after_layer: Optional[int] = None,
         return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, BaseModelOutputWithPast]:
+    ) -> Union[Tuple, BaseModelOutputWithPastAndCapture]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1114,6 +1122,22 @@ class Emu3Model(Emu3PreTrainedModel):
         use_cache = use_cache if use_cache is not None else self.config.use_cache
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if capture_hidden_before_layer is not None:
+            capture_hidden_before_layer = int(capture_hidden_before_layer)
+            if capture_hidden_before_layer < 0 or capture_hidden_before_layer >= len(self.layers):
+                raise ValueError(
+                    "capture_hidden_before_layer must be within [0, num_hidden_layers). "
+                    f"Got {capture_hidden_before_layer} for num_hidden_layers={len(self.layers)}."
+                )
+
+        if stop_after_layer is not None:
+            stop_after_layer = int(stop_after_layer)
+            if stop_after_layer < 0 or stop_after_layer > len(self.layers):
+                raise ValueError(
+                    "stop_after_layer must be within [0, num_hidden_layers]. "
+                    f"Got {stop_after_layer} for num_hidden_layers={len(self.layers)}."
+                )
 
         # retrieve input_ids and inputs_embeds
         if input_ids is not None and inputs_embeds is not None:
@@ -1180,8 +1204,17 @@ class Emu3Model(Emu3PreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
+        captured_hidden_state = None
 
-        for decoder_layer in self.layers:
+        for layer_idx, decoder_layer in enumerate(self.layers):
+            if stop_after_layer is not None and layer_idx >= stop_after_layer:
+                break
+            if (
+                capture_hidden_before_layer is not None
+                and captured_hidden_state is None
+                and layer_idx == capture_hidden_before_layer
+            ):
+                captured_hidden_state = hidden_states
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -1213,7 +1246,9 @@ class Emu3Model(Emu3PreTrainedModel):
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
-        hidden_states = self.norm(hidden_states)
+        apply_final_norm = stop_after_layer is None or stop_after_layer >= len(self.layers)
+        if apply_final_norm:
+            hidden_states = self.norm(hidden_states)
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
@@ -1228,11 +1263,12 @@ class Emu3Model(Emu3PreTrainedModel):
                 for v in [hidden_states, next_cache, all_hidden_states, all_self_attns]
                 if v is not None
             )
-        return BaseModelOutputWithPast(
+        return BaseModelOutputWithPastAndCapture(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
+            captured_hidden_state=captured_hidden_state,
         )
 
 
