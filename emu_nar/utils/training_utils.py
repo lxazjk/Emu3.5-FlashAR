@@ -10,8 +10,7 @@ import torch.distributed as dist
 from tqdm import tqdm
 
 from emu_nar.utils.checkpoint_utils import (
-    save_epoch_checkpoint,
-    save_step_checkpoint,
+    save_checkpoint,
 )
 from emu_nar.utils.eval_utils import run_epoch_generate
 from emu_nar.utils.model_utils import (
@@ -274,6 +273,39 @@ def _maybe_finish_vertical_warmup(
         )
 
 
+def _should_run_on_step(global_step: int, interval: int) -> bool:
+    return interval > 0 and global_step > 0 and global_step % interval == 0
+
+
+def _commit_optimizer_step(
+    args: argparse.Namespace,
+    *,
+    wrapper: Any,
+    state: TrainingLoopState,
+    warmup_target: torch.nn.Module,
+    progress: Any,
+    is_main: bool,
+) -> None:
+    if args.grad_clip > 0:
+        torch.nn.utils.clip_grad_norm_(wrapper.parameters(), args.grad_clip)
+    state.optimizer.step()
+    state.optimizer.zero_grad(set_to_none=True)
+    if state.scheduler is not None:
+        state.scheduler.step()
+
+    state.global_step += 1
+    if progress is not None:
+        progress.update(1)
+
+    _maybe_start_cosine_scheduler(args, state, is_main=is_main)
+    _maybe_finish_vertical_warmup(
+        args,
+        state,
+        warmup_target=warmup_target,
+        is_main=is_main,
+    )
+
+
 def _log_step_metrics(
     args: argparse.Namespace,
     state: TrainingLoopState,
@@ -284,13 +316,13 @@ def _log_step_metrics(
     is_main: bool,
     epoch: int,
 ) -> None:
-    should_log_progress = (
-        args.log_every_steps > 0 and state.global_step % args.log_every_steps == 0
-    )
+    if state.global_step <= 0:
+        return
+
+    should_log_progress = _should_run_on_step(state.global_step, args.log_every_steps)
     should_log_wandb = (
         args.wandb
-        and args.wandb_log_interval > 0
-        and state.global_step % args.wandb_log_interval == 0
+        and _should_run_on_step(state.global_step, args.wandb_log_interval)
     )
     if not (should_log_progress or should_log_wandb):
         return
@@ -363,29 +395,92 @@ def _log_step_metrics(
         )
 
 
+def _run_post_optimizer_step(
+    args: argparse.Namespace,
+    state: TrainingLoopState,
+    *,
+    metrics: StepMetrics,
+    progress: Any,
+    world_size: int,
+    is_main: bool,
+    epoch: int,
+    wrapper: Any,
+    tokenizer: Any,
+    device: torch.device,
+    visual_token_offset: int,
+    rank: int,
+) -> bool:
+    _log_step_metrics(
+        args,
+        state,
+        metrics=metrics,
+        progress=progress,
+        world_size=world_size,
+        is_main=is_main,
+        epoch=epoch,
+    )
+
+    if _should_run_on_step(state.global_step, args.save_every_steps):
+        save_checkpoint(
+            args,
+            wrapper,
+            rank,
+            is_main,
+            state.global_step,
+            epoch=epoch,
+            save_reason="step",
+        )
+    if _should_run_on_step(state.global_step, args.eval_generate_every_steps):
+        state.vq_model, state.vq_dtype = run_epoch_generate(
+            args,
+            wrapper,
+            tokenizer,
+            state.vq_model,
+            state.vq_dtype,
+            device,
+            visual_token_offset,
+            rank,
+            is_main,
+            epoch,
+            run_tag=f"step{state.global_step}",
+        )
+    if args.max_steps > 0 and state.global_step >= args.max_steps:
+        if is_main:
+            print(f"[INFO] reached max_steps={args.max_steps}; stopping training.")
+        return True
+    return False
+
+
 def _finalize_partial_accumulation(
     args: argparse.Namespace,
     *,
     wrapper: Any,
-    optimizer: torch.optim.Optimizer,
+    state: TrainingLoopState,
+    warmup_target: torch.nn.Module,
     last_step: Optional[int],
     accum_steps: int,
+    progress: Any,
     is_main: bool,
-) -> None:
+) -> bool:
     if accum_steps <= 1 or last_step is None or (last_step + 1) % accum_steps == 0:
-        return
+        return False
     if args.fsdp:
         if is_main:
             print(
                 "[WARN] Dropping last incomplete grad accumulation for FSDP; "
                 "set grad_accum_steps=1 or make epoch length divisible to avoid this."
             )
-        optimizer.zero_grad(set_to_none=True)
-        return
-    if args.grad_clip > 0:
-        torch.nn.utils.clip_grad_norm_(wrapper.parameters(), args.grad_clip)
-    optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
+        state.optimizer.zero_grad(set_to_none=True)
+        return False
+    _commit_optimizer_step(
+        args,
+        wrapper=wrapper,
+        state=state,
+        warmup_target=warmup_target,
+        progress=progress,
+        is_main=is_main,
+    )
+    return True
 
 
 def run_training_epochs(
@@ -428,6 +523,7 @@ def run_training_epochs(
         progress = tqdm(desc=f"epoch {epoch}") if is_main else None
         data_iter = iter(loader)
         last_step = None
+        last_metrics: Optional[StepMetrics] = None
         step = 0
         while True:
             has_batch = True
@@ -481,89 +577,81 @@ def run_training_epochs(
                     accum_steps=accum_steps,
                     vertical_only_active=state.vertical_only_active,
                 )
+            last_metrics = metrics
 
             if is_sync_step:
-                if args.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(wrapper.parameters(), args.grad_clip)
-                state.optimizer.step()
-                state.optimizer.zero_grad(set_to_none=True)
-                if state.scheduler is not None:
-                    state.scheduler.step()
+                _commit_optimizer_step(
+                    args,
+                    wrapper=wrapper,
+                    state=state,
+                    warmup_target=warmup_target,
+                    progress=progress,
+                    is_main=is_main,
+                )
+                stop_training = _run_post_optimizer_step(
+                    args,
+                    state,
+                    metrics=metrics,
+                    progress=progress,
+                    world_size=world_size,
+                    is_main=is_main,
+                    epoch=epoch,
+                    wrapper=wrapper,
+                    tokenizer=tokenizer,
+                    device=device,
+                    visual_token_offset=visual_token_offset,
+                    rank=rank,
+                )
+                if stop_training:
+                    break
 
-            state.global_step += 1
-            if progress is not None:
-                progress.update(1)
+            step += 1
 
-            _maybe_start_cosine_scheduler(args, state, is_main=is_main)
-            _maybe_finish_vertical_warmup(
+        if not stop_training and _finalize_partial_accumulation(
+            args,
+            wrapper=wrapper,
+            state=state,
+            warmup_target=warmup_target,
+            last_step=last_step,
+            accum_steps=accum_steps,
+            progress=progress,
+            is_main=is_main,
+        ):
+            if last_metrics is None:
+                raise RuntimeError("partial accumulation flushed without any recorded step metrics")
+            stop_training = _run_post_optimizer_step(
                 args,
                 state,
-                warmup_target=warmup_target,
-                is_main=is_main,
-            )
-            _log_step_metrics(
-                args,
-                state,
-                metrics=metrics,
+                metrics=last_metrics,
                 progress=progress,
                 world_size=world_size,
                 is_main=is_main,
                 epoch=epoch,
+                wrapper=wrapper,
+                tokenizer=tokenizer,
+                device=device,
+                visual_token_offset=visual_token_offset,
+                rank=rank,
             )
-
-            if args.save_every_steps > 0 and state.global_step % args.save_every_steps == 0:
-                save_step_checkpoint(args, wrapper, rank, is_main, state.global_step)
-            if (
-                args.eval_generate_every_steps > 0
-                and state.global_step % args.eval_generate_every_steps == 0
-            ):
-                state.vq_model, state.vq_dtype = run_epoch_generate(
-                    args,
-                    wrapper,
-                    tokenizer,
-                    state.vq_model,
-                    state.vq_dtype,
-                    device,
-                    visual_token_offset,
-                    rank,
-                    is_main,
-                    epoch,
-                    run_tag=f"step{state.global_step}",
-                )
-            if args.max_steps > 0 and state.global_step >= args.max_steps:
-                stop_training = True
-                if is_main:
-                    print(f"[INFO] reached max_steps={args.max_steps}; stopping training.")
-                break
-
-            step += 1
 
         if progress is not None:
             progress.close()
-
-        _finalize_partial_accumulation(
-            args,
-            wrapper=wrapper,
-            optimizer=state.optimizer,
-            last_step=last_step,
-            accum_steps=accum_steps,
-            is_main=is_main,
-        )
 
         if stop_training:
             if is_main:
                 print("[INFO] max_steps reached, skip epoch-end checkpoint/generation.")
             break
 
-        save_epoch_checkpoint(
-            args,
-            wrapper,
-            rank,
-            is_main,
-            epoch,
-            state.global_step,
-            state.save_epoch_mode,
-        )
+        if state.save_epoch_mode != "none":
+            save_checkpoint(
+                args,
+                wrapper,
+                rank,
+                is_main,
+                state.global_step,
+                epoch=epoch,
+                save_reason="epoch",
+            )
 
         if args.eval_generate_timing in ("end", "both"):
             state.vq_model, state.vq_dtype = run_epoch_generate(

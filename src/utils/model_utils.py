@@ -17,6 +17,7 @@ from ..vision_tokenizer import build_vision_tokenizer
 from .nar_checkpoint_utils import (
     infer_vertical_from_state as _infer_vertical_from_state,
     load_state_with_allowed_missing as _load_state_with_allowed_missing,
+    load_nar_metadata as _load_nar_metadata,
     resolve_nar_ckpt_path as _resolve_nar_ckpt_path,
     safe_torch_load as _safe_torch_load,
 )
@@ -107,10 +108,12 @@ def build_emu3p5_nar_inference(
     vq_device="cuda:0",
     nar_use_vertical_block=None,
     nar_vertical_layers=0,
+    nar_vertical_start_layer=-1,
     nar_attn_implementation="eager",
     nar_merge_dtype="bf16",
     nar_fsdp_wrap_policy="transformer",
     nar_fsdp_min_params=1_000_000,
+    nar_split_backbone=False,
     **kwargs,
 ):
     _validate_model_path(model_path)
@@ -132,6 +135,7 @@ def build_emu3p5_nar_inference(
     )
     print(f"[NAR-LOAD] loading checkpoint from {resolved_ckpt_path}", flush=True)
     state = _safe_torch_load(resolved_ckpt_path, mmap=True)
+    nar_metadata = _load_nar_metadata(resolved_ckpt_path)
     print("[NAR-LOAD] checkpoint deserialized on CPU", flush=True)
 
     inferred_use_vertical, inferred_vertical_layers = _infer_vertical_from_state(state)
@@ -145,7 +149,6 @@ def build_emu3p5_nar_inference(
         vertical_layers = inferred_vertical_layers
     else:
         vertical_layers = 1 if use_vertical_block else 0
-
     backbone_state = {}
     nar_head_state = {}
     for key, value in state.items():
@@ -169,6 +172,12 @@ def build_emu3p5_nar_inference(
         model_path,
         trust_remote_code=True,
     )
+    if int(nar_vertical_start_layer) >= 0:
+        vertical_start_layer = int(nar_vertical_start_layer)
+    elif "vertical_start_layer" in nar_metadata:
+        vertical_start_layer = int(nar_metadata["vertical_start_layer"])
+    else:
+        vertical_start_layer = int(model_config.num_hidden_layers)
     model_config._attn_implementation = nar_attn_implementation
     # Avoid Transformers' flex-attention architecture allowlist check by
     # constructing the model directly and loading the already-extracted
@@ -201,13 +210,14 @@ def build_emu3p5_nar_inference(
         pretrained_backbone=backbone,
         vocab_size=model_config.vocab_size,
         hidden_size=model_config.hidden_size,
-        num_heads=model_config.num_attention_heads,
         pad_token_id=-100,
         mask_token_id=model_config.pad_token_id,
         visual_token_offset=int(model_config.eoi_token_id) + 1,
         use_vertical_block=use_vertical_block,
         vertical_layers=max(1, vertical_layers) if use_vertical_block else 0,
+        vertical_start_layer=vertical_start_layer,
         lm_head=None,
+        split_backbone=bool(nar_split_backbone),
     )
     print("[NAR-LOAD] loading NAR head weights", flush=True)
     _load_state_with_allowed_missing(

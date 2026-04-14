@@ -7,13 +7,10 @@ cfg_name = Path(__file__).stem
 
 model_path = "./weights/Emu3.5" # download from hf
 vq_path = "./weights/Emu3.5-VisionTokenizer" # download from hf
-nar_ckpt_path = "./outputs/nar_finetune/nar_epoch10.pt"  # NAR head checkpoint path (required for NAR decoding)
+nar_ckpt_path = "./outputs/nar_finetune/nar_final"  # NAR head checkpoint path (required for NAR decoding)
 nar_use_vertical_block = True
 nar_vertical_layers = 4
-nar_lora_layers = 4
-nar_lora_r = 16
-nar_lora_alpha = 32
-nar_lora_dropout = 0.05
+nar_vertical_start_layer = -1
 
 tokenizer_path = "./src/tokenizer_emu3_ibq"
 vq_type = "ibq"

@@ -154,7 +154,6 @@ def _run_nar_t2i(
         top_k=int(cfg.sampling_params.get("image_top_k", 0)),
         top_p=float(cfg.sampling_params.get("image_top_p", 1.0)),
         sample_logits=bool(cfg.sampling_params.get("do_sample", True)),
-        use_kv_cache=bool(getattr(cfg, "nar_use_kv_cache", True)),
     )
     sync_cuda()
     infer_seconds = time.perf_counter() - infer_start
@@ -209,6 +208,7 @@ def _run_single_mode(mode_name: str, cfg_path: str, out_root: str) -> Dict[str, 
             vq_device=cfg.vq_device,
             nar_use_vertical_block=getattr(cfg, "nar_use_vertical_block", None),
             nar_vertical_layers=int(getattr(cfg, "nar_vertical_layers", 0)),
+            nar_vertical_start_layer=int(getattr(cfg, "nar_vertical_start_layer", -1)),
             nar_attn_implementation=str(getattr(cfg, "nar_attn_implementation", "eager")),
             nar_merge_dtype=str(getattr(cfg, "nar_merge_dtype", "bf16")),
             nar_fsdp_wrap_policy=str(getattr(cfg, "nar_fsdp_wrap_policy", "transformer")),
@@ -281,7 +281,6 @@ def _run_single_mode(mode_name: str, cfg_path: str, out_root: str) -> Dict[str, 
         "nar_ckpt_path": resolved_nar_ckpt_path or getattr(cfg, "nar_ckpt_path", ""),
         "load_mode": load_mode,
         "nar_attn_implementation": str(getattr(cfg, "nar_attn_implementation", "")),
-        "nar_use_kv_cache": bool(getattr(cfg, "nar_use_kv_cache", True)),
         "hf_device": str(cfg.hf_device),
         "vq_device": str(cfg.vq_device),
         "height": int(cfg.target_height),
@@ -334,7 +333,6 @@ def main() -> None:
             f"mode={metrics['mode']} "
             f"load_mode={metrics['load_mode']} "
             f"attn={metrics['nar_attn_implementation'] or 'default'} "
-            f"kv_cache={metrics.get('nar_use_kv_cache', False)} "
             f"load={metrics['load_seconds']:.2f}s "
             f"infer={metrics['infer_seconds']:.2f}s "
             f"decode={metrics['decode_seconds']:.2f}s "

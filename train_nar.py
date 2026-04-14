@@ -16,7 +16,7 @@ from emu_nar.utils.checkpoint_utils import (
     prepare_output_dir as _prepare_output_dir,
     resolve_resume_path as _resolve_resume_path,
     resume_if_needed as _resume_if_needed,
-    save_final_checkpoint as _save_final_checkpoint,
+    save_checkpoint as _save_checkpoint,
 )
 from emu_nar.utils.config_utils import load_train_arg_defaults
 from emu_nar.utils.model_utils import (
@@ -117,6 +117,12 @@ def parse_args() -> argparse.Namespace:
         choices=["auto", "none", "sharded", "full"],
         help="Per-epoch checkpoint mode.",
     )
+    parser.add_argument(
+        "--hf_max_shard_size",
+        type=str,
+        default="5GB",
+        help="HF safetensors max shard size for saved checkpoints, e.g. 5GB.",
+    )
     parser.add_argument("--eval_generate_prompt", type=str, default="")
     parser.add_argument("--eval_generate_height", type=int, default=0)
     parser.add_argument("--eval_generate_width", type=int, default=0)
@@ -148,6 +154,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use_vertical_block", action="store_true")
     parser.add_argument("--vertical_layers", type=int, default=0)
     parser.add_argument(
+        "--vertical_start_layer",
+        type=int,
+        default=-1,
+        help=(
+            "Backbone layer index where the vertical branch starts. "
+            "Set <0 to auto-use num_hidden_layers - vertical_layers."
+        ),
+    )
+    parser.add_argument(
         "--vertical_head_warmup_steps",
         type=int,
         default=0,
@@ -174,6 +189,8 @@ def parse_args() -> argparse.Namespace:
             "Set <=0 to disable."
         ),
     )
+    parser.add_argument("--split_backbone", action="store_true",
+                        help="Split backbone at vertical_start_layer for parallel H/V branches.")
     parser.add_argument("--gradient_checkpointing", action="store_true")
     parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--wandb_project", type=str, default="Emu3.5-NAR")
@@ -239,6 +256,24 @@ def main() -> None:
         raise ValueError("This training entry requires FSDP and hard-enables it in parse_args().")
     if not args.pretok_glob:
         raise ValueError("train.sh flow requires --pretok_glob with pretokenized tar shards.")
+    if args.grad_accum_steps < 1:
+        raise ValueError(f"grad_accum_steps must be >= 1, got {args.grad_accum_steps}.")
+    if args.fsdp_cpu_offload and args.grad_accum_steps > 1 and not args.fsdp_no_sync:
+        raise ValueError(
+            "Unsupported FSDP config: fsdp_cpu_offload=true with grad_accum_steps>1 "
+            "requires fsdp_no_sync=true. PyTorch documents that gradient accumulation "
+            "outside no_sync() is not supported with CPU offloading."
+        )
+    if args.fsdp_cpu_offload and args.grad_accum_steps > 1 and args.fsdp_use_orig_params:
+        raise ValueError(
+            "Unsupported FSDP config for this training entry: "
+            "fsdp_use_orig_params=true + fsdp_cpu_offload=true + grad_accum_steps>1 "
+            "can trigger upstream FSDP backward-hook failures (for example "
+            "`AssertionError: check _post_backward_hook`) even when fsdp_no_sync=true. "
+            "Use one of these instead: set fsdp_cpu_offload=false, or set "
+            "grad_accum_steps=1. Keeping use_orig_params=true is still recommended "
+            "for this repo's trainable-parameter switching logic."
+        )
     if args.max_steps > 0 and args.vertical_head_warmup_steps >= args.max_steps:
         adjusted = max(0, args.max_steps - 1)
         if dist.is_initialized():
@@ -276,6 +311,13 @@ def main() -> None:
     model_config = Emu3Config.from_pretrained(args.model_path, trust_remote_code=True)
     backbone = _build_backbone(args, model_config, torch_dtype, device, is_main)
     wrapper, visual_token_offset = _build_wrapper(args, backbone, model_config, torch_dtype, device)
+    if is_main and getattr(wrapper, "use_vertical_block", False):
+        print(
+            "[INFO] vertical branch layout: "
+            f"start_layer={int(getattr(wrapper, 'vertical_start_layer', -1))} "
+            f"depth={int(getattr(wrapper, 'vertical_layers', 0))} "
+            f"backbone_layers={int(getattr(wrapper, 'backbone_num_layers', 0))}"
+        )
     preloaded_single_file_resume = _preload_single_file_resume_if_needed(
         args,
         wrapper,
@@ -324,7 +366,7 @@ def main() -> None:
     if args.lr_scheduler == "cosine" and args.max_steps > 0:
         if vertical_only_active:
             # Resume inside phase-1 warmup: recreate phase1 cosine scheduler if already past flat steps.
-            if args.phase1_flat_steps > 0 and global_step >= args.phase1_flat_steps:
+            if global_step >= args.phase1_flat_steps:
                 phase1_remaining = max(1, vertical_warmup_steps - args.phase1_flat_steps)
                 phase1_lr = float(optimizer.param_groups[0]["lr"])
                 phase1_lr_min = phase1_lr * args.lr_min_factor
@@ -380,7 +422,7 @@ def main() -> None:
 
     save_epoch_mode = args.save_epoch
     if save_epoch_mode == "auto":
-        save_epoch_mode = "sharded" if args.fsdp else "full"
+        save_epoch_mode = "full"
     wandb_run = _init_wandb(args, is_main)
     loop_state = TrainingLoopState(
         optimizer=optimizer,
@@ -411,7 +453,14 @@ def main() -> None:
         state=loop_state,
     )
 
-    _save_final_checkpoint(args, wrapper, rank)
+    _save_checkpoint(
+        args,
+        wrapper,
+        rank,
+        is_main,
+        loop_state.global_step,
+        save_reason="final",
+    )
     if is_main and wandb_run is not None:
         wandb_run.finish()
 

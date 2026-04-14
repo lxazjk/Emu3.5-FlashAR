@@ -211,7 +211,9 @@ def run_epoch_generate(
         sdp_ctx = torch.backends.cuda.sdp_kernel(
             enable_flash=False, enable_mem_efficient=False, enable_math=True
         )
-    with sdp_ctx, torch.inference_mode():
+    # FSDP orig-param writeback can fail after running the wrapped module inside
+    # inference_mode(), so keep eval generation on no_grad() instead.
+    with sdp_ctx, torch.no_grad():
         grid = decode_neighbor_grid(
             wrapper=wrapper,
             device=device,

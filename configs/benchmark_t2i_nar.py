@@ -16,26 +16,19 @@ def _env_float(name: str, default: float) -> float:
     return float(value) if value is not None and value != "" else default
 
 
-def _env_flag(name: str, default: bool) -> bool:
-    value = os.getenv(name)
-    if value is None or value == "":
-        return default
-    return value.lower() not in {"0", "false", "no", "off"}
-
-
 model_path = os.getenv("EMU35_IMAGE_MODEL_PATH", "./weights/Emu3.5-Image")
 vq_path = os.getenv("EMU35_VQ_PATH", "./weights/Emu3.5-VisionTokenizer")
 nar_ckpt_path = os.getenv(
     "EMU35_BENCH_NAR_CKPT",
-    "./outputs/nar_finetune_w1200_p235_gatefix_v010_gc010/nar_epoch_latest.full.pt",
+    "./outputs/nar_finetune/nar_final",
 )
 nar_use_vertical_block = True
 nar_vertical_layers = _env_int("EMU35_NAR_VERTICAL_LAYERS", 2)
+nar_vertical_start_layer = _env_int("EMU35_NAR_VERTICAL_START_LAYER", -1)
 nar_attn_implementation = os.getenv("EMU35_NAR_ATTN_IMPL", "eager")
 nar_merge_dtype = os.getenv("EMU35_NAR_MERGE_DTYPE", "bf16")
 nar_fsdp_wrap_policy = os.getenv("EMU35_NAR_FSDP_WRAP_POLICY", "transformer")
 nar_fsdp_min_params = _env_int("EMU35_NAR_FSDP_MIN_PARAMS", 1_000_000)
-nar_use_kv_cache = _env_flag("EMU35_NAR_USE_KV_CACHE", True)
 
 tokenizer_path = "./src/tokenizer_emu3_ibq"
 vq_type = "ibq"
