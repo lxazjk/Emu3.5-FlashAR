@@ -6,6 +6,7 @@
 
 [![arXiv](https://img.shields.io/badge/arXiv-2605.09430-b31b1b.svg)](https://arxiv.org/abs/2605.09430)
 [![Project](https://img.shields.io/badge/Project-Page-blue)](https://lxazjk.github.io/FlashAR/)
+[![Hugging Face](https://img.shields.io/badge/HuggingFace-Checkpoint-yellow)](https://huggingface.co/lxazjk/Emu3.5-Image-FlashAR)
 [![License](https://img.shields.io/badge/License-Apache--2.0-green.svg)](LICENSE)
 
 </div>
@@ -70,6 +71,9 @@ pip install flash_attn==2.8.3 --no-build-isolation
 
 Download the base Emu3.5-Image model, the Emu3.5 vision tokenizer, and the
 FlashAR checkpoint. The examples below assume this layout:
+
+The FlashAR checkpoint is available on Hugging Face:
+[lxazjk/Emu3.5-Image-FlashAR](https://huggingface.co/lxazjk/Emu3.5-Image-FlashAR).
 
 ```text
 weights/
@@ -321,10 +325,10 @@ python tools/benchmark_ar_vs_flashar.py \
 ## Citation
 
 ```bibtex
-@article{zhou2025flashar,
+@article{zhou2026flashar,
   title={FlashAR: Efficient Post-Training Acceleration for Autoregressive Image Generation},
   author={Zhou, Junkang and He, Yefei and Chen, Feng and Wang, Weijie and Zhuang, Bohan},
   journal={arXiv preprint arXiv:2605.09430},
-  year={2025}
+  year={2026}
 }
 ```
