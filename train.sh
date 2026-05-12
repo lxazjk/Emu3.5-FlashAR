@@ -2,7 +2,7 @@
 set -euo pipefail
 
 : "${PYTHON_BIN:=python3}"
-: "${TRAIN_CONFIG_JSON:=./configs/train_nar.default.json}"
+: "${TRAIN_CONFIG_JSON:=./configs/train_flashar.default.json}"
 : "${EXTRA_ARGS:=}"
 
 "${PYTHON_BIN}" - <<'PY'
@@ -17,7 +17,7 @@ PY
 readarray -t LAUNCHER_CFG < <(
   "${PYTHON_BIN}" - "${TRAIN_CONFIG_JSON}" <<'PY'
 import sys
-from emu_nar.utils.config_utils import load_launcher_config
+from flashar.utils.config_utils import load_launcher_config
 
 cfg = load_launcher_config(sys.argv[1])
 print(cfg["cuda_visible_devices"])
@@ -39,7 +39,7 @@ CMD=(torchrun)
 if [ "${STANDALONE}" = "1" ]; then
   CMD+=(--standalone)
 fi
-CMD+=(--nproc_per_node="${NPROC_PER_NODE}" train_nar.py --config_json "${TRAIN_CONFIG_JSON}")
+CMD+=(--nproc_per_node="${NPROC_PER_NODE}" train_flashar.py --config_json "${TRAIN_CONFIG_JSON}")
 
 if [ -n "${EXTRA_ARGS}" ]; then
   read -r -a EXTRA_ARR <<< "${EXTRA_ARGS}"

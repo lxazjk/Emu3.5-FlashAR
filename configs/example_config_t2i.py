@@ -7,8 +7,8 @@ cfg_name = Path(__file__).stem
 
 model_path = "./weights/Emu3.5-Image" # download from hf
 vq_path = "./weights/Emu3.5-VisionTokenizer" # download from hf
-nar_ckpt_path = ""  # NAR head checkpoint path (required for NAR decoding)
-nar_use_vertical_block = False
+flashar_ckpt_path = ""  # flashar head checkpoint path (required for flashar decoding)
+flashar_use_vertical_block = False
 
 tokenizer_path = "./src/tokenizer_emu3_ibq"
 vq_type = "ibq"

@@ -1,272 +1,340 @@
-<div align='center'>
-<h1>Emu3.5: Native Multimodal Models are World Learners</h1>
+# FlashAR
 
-Emu3.5 Team, BAAI
+**Efficient Post-Training Acceleration for Autoregressive Image Generation**
 
-[Project Page](https://emu.world/pages/web/landingPage) | [🤗HF Models](https://huggingface.co/collections/BAAI/emu35) | [Paper](https://arxiv.org/pdf/2510.26583) | [App](https://emu.world/pages/web/home?route=index)
-</div>
+[![arXiv](https://img.shields.io/badge/arXiv-2605.09430-b31b1b.svg)](https://arxiv.org/abs/2605.09430)
+[![Project](https://img.shields.io/badge/Project-Page-blue)](https://lxazjk.github.io/FlashAR/)
+[![License](https://img.shields.io/badge/License-Apache--2.0-green.svg)](LICENSE)
 
+This repository contains the Emu3.5-Image implementation of FlashAR. It provides
+the code needed to:
 
-> 🔔 **Latest**: Emu3.5 Web & Mobile Apps and vLLM offline inference are live — see [🔥 News](#news) for details.
+- run inference with an existing FlashAR checkpoint;
+- pretokenize image-text data into training shards;
+- post-train FlashAR on top of an Emu3.5-Image backbone;
+- generate and evaluate samples with GenEval-style metadata;
+- benchmark standard AR decoding against FlashAR diagonal decoding.
 
+<p align="center">
+  <img src="assets/teaser.png" width="95%" alt="Generated samples from FlashAR">
+</p>
 
-<div align='center'>
-<img src="./assets/arch.png" class="interpolation-image" alt="arch." height="100%" width="100%" />
-</div>
+## Paper
 
+**FlashAR: Efficient Post-Training Acceleration for Autoregressive Image Generation**
 
-<div align='center'>
-<img src="./assets/co.png" class="interpolation-image" alt="arch." height="90%" width="90%" />
-</div>
+Junkang Zhou*, Yefei He*, Feng Chen*, Weijie Wang, Bohan Zhuang
 
+Zhejiang University and University of Adelaide
 
-|  🔹 | **Core Concept**                         | **Description**                                                                                                                            |
-| :-: | :--------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------- |
-|  🧠 | **Unified World Modeling**               | Predicts the **next state jointly across vision and language**, enabling coherent **world modeling** and **generation**.              |
-|  🧩 | **End-to-End Pretraining**               | Trained with a **unified next-token prediction** objective over **interleaved vision–language sequences**.                                 |
-|  📚 | **Over 10T+ Multimodal Tokens**               | Pre-trained on **over 10 trillion interleaved tokens** from **video frames** and **transcripts**, capturing **spatiotemporal structure**.       |
-|  🔄 | **Native Multimodal I/O**                | Processes and generates **interleaved visual–text sequences** without **modality adapters** or **task-specific heads**.                    |
-|  🎯 | **RL Post-Training**                     | Large-scale **reinforcement learning** enhances **reasoning**, **compositionality**, and **generation quality**.                           |
-|  ⚡  | **Discrete Diffusion Adaptation (DiDA)** | Converts **sequential decoding → bidirectional parallel prediction**, achieving **≈20× faster inference without performance loss**.      |
-| 🖼️ | **Versatile Generation**                 | Excels in **long-horizon vision–language generation**, **any-to-image (X2I)** synthesis, and **text-rich image creation**.                 |
-|  🌐 | **Generalizable World Modeling**         | Enables **spatiotemporally consistent world exploration**, and **open-world embodied manipulation** across diverse scenarios.          |
-|  🏆 | **Performance Benchmark**                | Matches **Gemini 2.5 Flash Image (Nano Banana)** on **image generation/editing**, and **outperforms** on **interleaved generation tasks**. |
+Links:
 
+- Paper: [arXiv:2605.09430](https://arxiv.org/abs/2605.09430)
+- LlamaGen-Flash code: [lxazjk/LlamaGen-Flash](https://github.com/lxazjk/LlamaGen-Flash)
+- Emu3.5-Flash code: [lxazjk/Emu3.5-Flash](https://github.com/lxazjk/Emu3.5-Flash)
+- LlamaGen-Flash weights: [Hugging Face](https://huggingface.co/lxazjk/LlamaGen-Flash)
+- Emu3.5-Image-Flash weights: [Hugging Face](https://huggingface.co/lxazjk/Emu3.5-Image-Flash)
 
-<a id="news"></a>
+FlashAR accelerates a pretrained raster-scan autoregressive image generator by
+adding a vertical prediction branch and a learnable fusion gate. Decoding then
+proceeds by anti-diagonal steps, reducing the serial image-token decoding length
+from `H * W` to `H + W - 1`.
 
-## 🔥 News
+<p align="center">
+  <img src="assets/overview.png" width="86%" alt="Overview of FlashAR">
+</p>
 
-- **2025-11-28 · 🌐 Emu3.5 Web & Mobile Apps Live** — Official product experience is **now available** on the web at [zh.emu.world](https://zh.emu.world) (Mainland China) and [emu.world](https://emu.world) (global) 🎉 The new homepage highlights featured cases and a “Get Started” entry, while the workspace and mobile apps bring together creation, inspiration feed, history, profile, and language switch across web, Android APK, and H5. *([See more details](#official-web--mobile-apps) below.)*
-- **2025-11-19 · 🚀 vLLM Offline Inference Released** — Meet `inference_vllm.py` with a new cond/uncond batch scheduler, delivering **4–5× faster end-to-end generation** on vLLM 0.11.0 across Emu3.5 tasks. Jump to [#Run Inference with vLLM](#run-inference-with-vllm) for setup guidance and see PR [#47](https://github.com/baaivision/Emu3.5/pull/47) for full details.
-- **2025-11-17 · 🎛️ Gradio Demo (Transformers Backend)** — Introduced `gradio_demo_image.py` and `gradio_demo_interleave.py` presets for the standard Transformers runtime, providing turnkey T2I/X2I and interleaved generation experiences with streaming output. Try the commands in [#Gradio Demo](#3-gradio-demo) to launch both UIs locally.
+## Repository Layout
 
-## Table of Contents
+```text
+.
+├── flashar/                         # FlashAR model, data, training utilities
+│   ├── data/                        # Pretokenized dataset and preprocessing
+│   ├── inference/                   # Sampling and token-format helpers
+│   ├── model/                       # Emu3.5 FlashAR wrapper and decoding logic
+│   └── utils/                       # Config, checkpoint, optimizer, training helpers
+├── src/                             # Emu3.5 model, tokenizer, VQ tokenizer, runtime utils
+├── configs/                         # Training and benchmark configs
+├── tools/                           # GenEval, benchmarking, visualization scripts
+├── requirements/                    # Dependency sets
+├── train_flashar.py                 # Main FSDP training entry
+├── generate_flashar.py              # Single-prompt generation entry
+├── train.sh                         # Config-driven torchrun launcher
+├── generate.sh                      # Generation launcher
+├── tokenization.sh                  # Pretokenization launcher
+└── README.md
+```
 
-1. [Model & Weights](#1-model--weights)
-2. [Quick Start](#2-quick-start)
-3. [Gradio Demo](#3-gradio-demo)
-4. [Schedule](#4-schedule)
-5. [Citation](#5-citation)
+## Installation
 
-## 1. Model & Weights
-
-| Model name               | HF Weight |
-| ------------------------ | --------- |
-| Emu3.5               | [🤗 HF link](https://huggingface.co/BAAI/Emu3.5/tree/main) |
-| Emu3.5-Image                | [🤗 HF link](https://huggingface.co/BAAI/Emu3.5-Image/tree/main) |
-| Emu3.5-VisionTokenizer     | [🤗 HF link](https://huggingface.co/BAAI/Emu3.5-VisionTokenizer/tree/main) |
-
-
-*Note:*  
-- **Emu3.5** supports general-purpose multimodal predictions, including interleaved image-text generation and single-image generation (T2I/X2I) tasks.
-- **Emu3.5-Image** is a model focused on T2I/X2I tasks for best performance on these scenarios.
-- Both models are pure next-token predictors without DiDA acceleration (each image may take several minutes to generate).  
-- ⚡ **Stay tuned for DiDA-accelerated weights.**
-
-> 💡 **Usage tip:**  
-> For **interleaved image-text generation**, use **Emu3.5**.  
-> For **single-image generation** (T2I and X2I), use **Emu3.5-Image** for the best quality.
-
-
-
-## 2. Quick Start
-
-### Environment Setup
+Create a clean Python environment:
 
 ```bash
-# Requires Python 3.12 or higher.
-git clone https://github.com/baaivision/Emu3.5
-cd Emu3.5
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements/transformers.txt
 pip install flash_attn==2.8.3 --no-build-isolation
 ```
-### Configuration
 
-Edit `configs/config.py` to set:
+## Download Weights
 
-- Paths: `model_path`, `vq_path`
-  You can use either a **local path** (e.g., downloaded HuggingFace weights) or a **remote HuggingFace Hub ID** for automatic download:
-  ```python
-  vq_path = "BAAI/Emu3.5-VisionTokenizer"  # remote, auto-download
-  model_path = "BAAI/Emu3.5"               # remote, auto-download
-  # or
-  vq_path = "/path/to/local/Emu3.5-VisionTokenizer"  # local path
-  model_path = "/path/to/local/Emu3.5"               # local path
-  ```
-- Task template: `task_type in {t2i, x2i, howto, story, explore, vla}`
-- Input image: `use_image` (True to provide reference images, controls <|IMAGE|> token); set `reference_image` in each prompt to specify the image path. For x2i task, we recommand using `reference_image` as a list containing single/multiple image paths to be compatible with multi-image input.
-- Sampling: `sampling_params` (classifier_free_guidance, temperature, top_k/top_p, etc.)
-- Aspect Ratio (for t2i task): `aspect_ratio` ("4:3", "21:9", "1:1", "auto" etc..)
-
-### Run Inference
-
-```bash
-python inference.py --cfg configs/config.py
-```
-
-
-#### Example Configurations by Task
-Below are example commands for different tasks.
-Make sure to set CUDA_VISIBLE_DEVICES according to your available GPUs.
-
-
-```bash
-# 🖼️ Text-to-Image (T2I) task
-CUDA_VISIBLE_DEVICES=0 python inference.py --cfg configs/example_config_t2i.py
-
-# 🔄 Any-to-Image (X2I) task
-CUDA_VISIBLE_DEVICES=0,1 python inference.py --cfg configs/example_config_x2i.py
-
-# 🎯 Visual Guidance task
-CUDA_VISIBLE_DEVICES=0,1 python inference.py --cfg configs/example_config_visual_guidance.py
-
-# 📖 Visual Narrative task
-CUDA_VISIBLE_DEVICES=0,1 python inference.py --cfg configs/example_config_visual_narrative.py
-
-
-# After running inference, the model will generate results in protobuf format (.pb files) for each input prompt.
-```
-
-
-Protobuf outputs are written to `outputs/<exp_name>/proto/`. For better throughput, we recommend ≥2 GPUs.
-
-
-### Run Inference with vLLM
-
-#### vLLM Enviroment Setup
-
-1. [Optional Recommendation] Use a new virtual environment for vLLM backend.
-```bash
-conda create -n Emu3p5 python=3.12
-```
-
-2. Install vLLM and apply the patch files.
-```bash
-# Requires Python 3.12 or higher.
-# Recommended: CUDA 12.8.
-pip install -r requirements/vllm.txt
-pip install flash_attn==2.8.3 --no-build-isolation
-
-cd Emu3.5
-python src/patch/apply.py
-```
-
-#### Example Configurations by Task
-
-```bash
-# 🖼️ Text-to-Image (T2I) task
-CUDA_VISIBLE_DEVICES=0,1 python inference_vllm.py --cfg configs/example_config_t2i.py
-
-# 🔄 Any-to-Image (X2I) task
-CUDA_VISIBLE_DEVICES=0,1 python inference_vllm.py --cfg configs/example_config_x2i.py
-
-# 🎯 Visual Guidance task
-CUDA_VISIBLE_DEVICES=0,1 python inference_vllm.py --cfg configs/example_config_visual_guidance.py
-
-# 📖 Visual Narrative task
-CUDA_VISIBLE_DEVICES=0,1 python inference_vllm.py --cfg configs/example_config_visual_narrative.py
-```
-
-
-### Visualize Protobuf Outputs
-
-To visualize generated protobuf files (--video: Generate video visualizations for interleaved output):
-
-```bash
-python src/utils/vis_proto.py --input <input_proto_path> [--output <output_dir>] [--video]
-```
-
-- `--input`: supports a single `.pb` file or a directory; directories are scanned recursively.
-- `--output`: optional; defaults to `<input_dir>/results/<file_stem>` for files, or `<parent_dir_of_input>/results` for directories.
-
-Expected output directory layout (example):
+Download the base Emu3.5-Image model, the Emu3.5 vision tokenizer, and the
+FlashAR checkpoint. The examples below assume this layout:
 
 ```text
-results/<pb_name>/
-├── 000_question.txt
-├── 000_global_cot.txt
-├── 001_text.txt
-├── 001_00_image.png
-├── 001_00_image_cot.txt
-├── 002_text.txt
-├── 002_00_image.png
-├── ...
-└── video.mp4              # only when --video is enabled
+weights/
+├── Emu3.5-Image/
+└── Emu3.5-VisionTokenizer/
+
+checkpoints/
+└── Emu3.5-Image-Flash/
 ```
 
-Each `*_text.txt` stores decoded segments, `*_image.png` stores generated frames, and matching `*_image_cot.txt` keeps image-level chain-of-thought notes when available.
+The default scripts expect:
 
-## 3. Gradio Demo
+```text
+MODEL_PATH       ./weights/Emu3.5-Image
+TOKENIZER_PATH   ./src/tokenizer_emu3_ibq
+VQ_PATH          ./weights/Emu3.5-VisionTokenizer
+CKPT_PATH        ./checkpoints/Emu3.5-Image-Flash
+```
 
-We provide two Gradio Demos for different application scenarios:
+You can use different locations by setting environment variables or editing the
+JSON configs under `configs/`.
 
- Emu3.5-Image Demo —— Interactive interface optimized for Text-to-Image (T2I) and Any-to-Image (X2I) tasks:
+## Quick Start: Inference With Existing Weights
+
+Use this path if you already have:
+
+- the base Emu3.5-Image model;
+- the Emu3.5 vision tokenizer;
+- a trained FlashAR checkpoint.
+
+Recommended local layout:
+
+```text
+weights/Emu3.5-Image/
+weights/Emu3.5-VisionTokenizer/
+checkpoints/Emu3.5-Image-Flash/
+```
+
+Generate one image with the shell launcher:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 python gradio_demo_image.py --host 0.0.0.0 --port 7860
+MODEL_PATH=./weights/Emu3.5-Image \
+TOKENIZER_PATH=./src/tokenizer_emu3_ibq \
+VQ_PATH=./weights/Emu3.5-VisionTokenizer \
+CKPT_PATH=./checkpoints/Emu3.5-Image-Flash \
+PROMPT="a red car parked next to a blue mailbox" \
+CFG_SCALE=5.0 \
+OUT_PATH=./outputs/sample.png \
+bash generate.sh
 ```
 
-Emu3.5-Interleave Demo —— Launch Emu3.5 Interleave Tasks (Visual Guidance and Visual Narrate) Gradio Demo
+The launcher uses the default 32 x 32 visual-token grid.
+
+Important generation options:
+
+| Option | Description |
+| --- | --- |
+| `CFG_SCALE` | Classifier-free guidance scale. |
+| `PROMPT` | Text prompt. |
+| `OUT_PATH` | Output image path. |
+| `USE_VERTICAL_BLOCK` | `auto` by default; set `1` or `0` to force the branch on or off. |
+| `SPLIT_BACKBONE` | Set `1` if the checkpoint was trained with split backbone inference. |
+
+## Full Training Pipeline
+
+The training workflow is:
+
+```text
+raw image-text data -> pretokenize -> train FlashAR -> generate/evaluate
+```
+
+### Step 1: Pretokenize Data
+
+Training reads tar shards containing visual tokens and captions. Each sample in
+a shard contains:
+
+```text
+<sample>.pt   # visual token tensor and shape metadata
+<sample>.txt  # text prompt or caption
+```
+
+Run pretokenization with `tokenization.sh`:
+
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 python gradio_demo_interleave.py --host 0.0.0.0 --port 7860
+JSON_PATH=./data/GPT4o-Image/text_to_image.json \
+IMAGE_ROOT=./data/GPT4o-Image \
+OUTPUT_DIR=./data/GPT4o-Image_pretok_32 \
+VQ_PATH=./weights/Emu3.5-VisionTokenizer \
+SHARD_SIZE=5000 \
+NPROC_PER_NODE=8 \
+bash tokenization.sh
 ```
 
-### Features
+Key variables:
 
-- Image Generation: Support Text-to-Image Generation and Multimodal Image Generation
-- Interleaved Generation: Support long-sequence creation with alternating image and text generation
-- Multiple Aspect Ratios for T2I: 9 preset aspect ratios (4:3, 16:9, 1:1, etc.) plus auto mode
-- Chain-of-Thought Display: Automatically parse and format model's internal thinking process
-- Real-time Streaming: Stream text and image generation with live updates
+| Variable | Description |
+| --- | --- |
+| `JSON_PATH` | Input metadata JSON containing image paths and text. |
+| `IMAGE_ROOT` | Root directory for source images. |
+| `OUTPUT_DIR` | Directory where tar shards are written. |
+| `SPLIT` | Split name under `OUTPUT_DIR`; default is `text_to_image`. |
+| `VQ_PATH` | Emu3.5 vision tokenizer path. |
+| `SHARD_SIZE` | Number of samples per tar shard. |
+| `NPROC_PER_NODE` | Number of distributed pretokenization workers. |
 
-### Official Web & Mobile Apps
+After this step, point `data.pretok_glob` in the training config to the produced
+tar files, for example:
 
-- **Web**: Production-ready Emu3.5 experience is available at [zh.emu.world](https://zh.emu.world) (Mainland China) and [emu.world](https://emu.world) (global), featuring a curated homepage, “Create” workspace, inspiration feed, history, personal profile, and language switching.
-- **Mobile (Android APK & H5)**: Mobile clients provide the same core flows — prompt-based creation, “inspiration” gallery, personal center, and feedback & privacy entrypoints — with automatic UI language selection based on system settings.
-- **Docs**: For product usage details, see the **Emu3.5 AI 使用指南 (Chinese)** and **Emu3.5 AI User Guide (English)**:  
-  - CN: [Emu3.5 AI 使用指南](https://jwolpxeehx.feishu.cn/wiki/BKuKwkzZOi4pdRkVV13csI0FnIg?from=from_copylink)  
-  - EN: [Emu3.5 AI User Guide](https://jwolpxeehx.feishu.cn/wiki/Gcxtw9XHhisUu8kBEaac6s6xnhc?from=from_copylink)
+```text
+./data/GPT4o-Image_pretok_32/text_to_image_partfirst/*.tar
+```
 
-#### Mobile App Download (QR Codes)
+### Step 2: Train FlashAR
 
-<div align='center'>
-  <table>
-    <tr>
-      <td align="center">
-        <img src="./assets/qr_zh.png" alt="Emu3.5 Mobile App (Mainland China)" width="220" />
-        <br />
-        <sub><b>Emu3.5 Mobile · Mainland China</b></sub>
-      </td>
-      <td align="center">
-        <img src="./assets/qr.png" alt="Emu3.5 Mobile App (Global)" width="220" />
-        <br />
-        <sub><b>Emu3.5 Mobile · Global</b></sub>
-      </td>
-    </tr>
-  </table>
-</div>
+Edit `configs/train_flashar.default.json` so that the paths match your machine:
 
-
-
-## 4. Schedule
-
-- [x] Inference Code (NTP Version)
-- [ ] Advanced Image Decoder
-- [ ] Discrete Diffusion Adaptation (DiDA) Inference & Weights
-
-
-## 5. Citation
-
-```bibtex
-@misc{cui2025emu35nativemultimodalmodels,
-      title={Emu3.5: Native Multimodal Models are World Learners}, 
-      author={Yufeng Cui and Honghao Chen and Haoge Deng and Xu Huang and Xinghang Li and Jirong Liu and Yang Liu and Zhuoyan Luo and Jinsheng Wang and Wenxuan Wang and Yueze Wang and Chengyuan Wang and Fan Zhang and Yingli Zhao and Ting Pan and Xianduo Li and Zecheng Hao and Wenxuan Ma and Zhuo Chen and Yulong Ao and Tiejun Huang and Zhongyuan Wang and Xinlong Wang},
-      year={2025},
-      eprint={2510.26583},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2510.26583}, 
+```json
+{
+  "paths": {
+    "model_path": "./weights/Emu3.5-Image",
+    "tokenizer_path": "./src/tokenizer_emu3_ibq",
+    "vq_path": "./weights/Emu3.5-VisionTokenizer",
+    "save_dir": "./outputs/flashar_finetune",
+    "resume_path": ""
+  },
+  "data": {
+    "pretok_glob": "./data/GPT4o-Image_pretok_32/text_to_image_partfirst/*.tar"
+  }
 }
 ```
 
+Start training:
+
+```bash
+TRAIN_CONFIG_JSON=./configs/train_flashar.default.json bash train.sh
+```
+
+Override common options without editing the config:
+
+```bash
+TRAIN_CONFIG_JSON=./configs/train_flashar.default.json \
+EXTRA_ARGS="--max_steps 1000 --save_every_steps 100 --lr 1e-5" \
+bash train.sh
+```
+
+Resume or continue from a FlashAR checkpoint:
+
+```bash
+TRAIN_CONFIG_JSON=./configs/train_flashar.default.json \
+EXTRA_ARGS="--resume_path ./checkpoints/Emu3.5-Image-Flash --save_dir ./outputs/continue_lr1e6 --lr 1e-6 --lr_scheduler none" \
+bash train.sh
+```
+
+Main training config fields:
+
+| Field | Description |
+| --- | --- |
+| `launcher.cuda_visible_devices` | CUDA devices used by `torchrun`. |
+| `launcher.nproc_per_node` | Number of distributed processes. |
+| `paths.model_path` | Base Emu3.5-Image model. |
+| `paths.vq_path` | Emu3.5 vision tokenizer. |
+| `paths.save_dir` | Output directory for checkpoints. |
+| `paths.resume_path` | Optional checkpoint used to resume. |
+| `data.pretok_glob` | Glob for pretokenized tar shards. |
+| `optimization.lr` | Main learning rate. |
+| `optimization.max_steps` | Maximum optimizer steps. |
+| `optimization.train_backbone` | Whether to update the backbone. |
+| `model.use_vertical_block` | Enable the vertical branch. |
+| `model.vertical_layers` | Number of vertical branch layers. |
+
+The training script saves the final FlashAR checkpoint to:
+
+```text
+<save_dir>/flashar_final/
+```
+
+### Step 3: Evaluate
+
+First generate images in GenEval format:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python tools/generate_geneval_flashar.py \
+  --model_path ./weights/Emu3.5-Image \
+  --tokenizer_path ./src/tokenizer_emu3_ibq \
+  --vq_path ./weights/Emu3.5-VisionTokenizer \
+  --ckpt_path ./outputs/flashar_finetune/flashar_final \
+  --metadata ./datasets/geneval/prompts/evaluation_metadata.jsonl \
+  --outdir ./outputs/geneval_flashar/images \
+  --samples_per_prompt 4 \
+  --cfg_scale 5.0 \
+  --dtype bf16
+```
+
+Expected generated layout:
+
+```text
+outputs/geneval_flashar/images/<prompt_id>/samples/0000.png
+outputs/geneval_flashar/images/<prompt_id>/samples/0001.png
+outputs/geneval_flashar/images/<prompt_id>/metadata.jsonl
+```
+
+Download the official GenEval repository to `geneval/`, install its evaluation
+dependencies, and run the scorer:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python geneval/evaluation/evaluate_images.py \
+  ./outputs/geneval_flashar/images \
+  --outfile ./outputs/geneval_flashar/results.jsonl \
+  --model-path ./weights/geneval_detectors
+
+python geneval/evaluation/summary_scores.py \
+  ./outputs/geneval_flashar/results.jsonl
+```
+
+## Benchmark AR vs FlashAR
+
+Compare standard AR decoding and FlashAR decoding:
+
+```bash
+EMU35_BENCH_FLASHAR_CKPT=./checkpoints/Emu3.5-Image-Flash \
+python tools/benchmark_ar_vs_flashar.py \
+  --ar_cfg configs/benchmark_t2i_ar.py \
+  --flashar_cfg configs/benchmark_t2i_flashar.py \
+  --out_dir outputs/bench_ar_vs_flashar
+```
+
+## Results
+
+**Emu3.5-Image-34B inference efficiency at 512 x 512.**
+
+| Method | Type | Steps | Data | Latency (s) | Decoding steps |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Emu3.5-Image | From scratch | 940K | 150B | 130.10 | 1024 |
+| BlockDiffusion | Post-training | 50K | 80M | 6.17 | 64 |
+| **FlashAR** | Post-training | 50K | 80M | **5.68** | **63** |
+
+**Emu3.5-Image-34B GenEval at 512 x 512.**
+
+| Method | Overall | Single Obj | Two Obj | Counting | Colors | Position | Color Attr |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Emu3.5-Image | 80.48 | 100.00 | 94.95 | 53.75 | 90.96 | 73.00 | 70.25 |
+| BlockDiffusion | 73.83 | 96.88 | 88.89 | 47.50 | 85.64 | 68.00 | 58.44 |
+| **FlashAR** | **80.29** | 98.75 | 91.92 | 53.75 | **92.55** | **80.00** | 64.00 |
+
+<p align="center">
+  <img src="assets/apendix_emu.png" width="95%" alt="Text-guided generation samples">
+</p>
+
+## Citation
+
+```bibtex
+@article{zhou2025flashar,
+  title={FlashAR: Efficient Post-Training Acceleration for Autoregressive Image Generation},
+  author={Zhou, Junkang and He, Yefei and Chen, Feng and Wang, Weijie and Zhuang, Bohan},
+  journal={arXiv preprint arXiv:2605.09430},
+  year={2025}
+}
+```

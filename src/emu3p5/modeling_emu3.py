@@ -81,6 +81,25 @@ logger = logging.get_logger(__name__)
 _CONFIG_FOR_DOC = "Emu3Config"
 
 
+def _get_usable_cache_length(cache, new_seq_length: int, layer_idx: int = 0) -> int:
+    if hasattr(cache, "get_usable_length"):
+        try:
+            return cache.get_usable_length(new_seq_length, layer_idx)
+        except TypeError:
+            return cache.get_usable_length(new_seq_length)
+
+    past_length = cache.get_seq_length(layer_idx)
+    if hasattr(cache, "get_max_cache_shape"):
+        max_length = cache.get_max_cache_shape(layer_idx)
+    elif hasattr(cache, "get_max_length"):
+        max_length = cache.get_max_length()
+    else:
+        max_length = None
+    if max_length is not None and max_length > 0:
+        return min(past_length, max_length - new_seq_length)
+    return past_length
+
+
 @dataclass
 class BaseModelOutputWithPastAndCapture(BaseModelOutputWithPast):
     captured_hidden_state: Optional[torch.FloatTensor] = None
@@ -418,7 +437,7 @@ class Emu3Attention(nn.Module):
                     "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                     "with a layer index."
                 )
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            kv_seq_len += _get_usable_cache_length(past_key_value, kv_seq_len, self.layer_idx)
             rotary_seq_len = kv_seq_len
         if position_ids is not None:
             # Allow callers to pass offset position ids (e.g. image-only sub-sequences
@@ -530,7 +549,7 @@ class Emu3FlashAttention2(Emu3Attention):
         kv_seq_len = key_states.shape[-2]
         rotary_seq_len = kv_seq_len
         if past_key_value is not None:
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            kv_seq_len += _get_usable_cache_length(past_key_value, kv_seq_len, self.layer_idx)
             rotary_seq_len = kv_seq_len
         if position_ids is not None:
             rotary_seq_len = max(rotary_seq_len, int(position_ids.max().item()) + 1)
@@ -728,7 +747,7 @@ class Emu3SdpaAttention(Emu3Attention):
         kv_seq_len = key_states.shape[-2]
         rotary_seq_len = kv_seq_len
         if past_key_value is not None:
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            kv_seq_len += _get_usable_cache_length(past_key_value, kv_seq_len, self.layer_idx)
             rotary_seq_len = kv_seq_len
         if position_ids is not None:
             rotary_seq_len = max(rotary_seq_len, int(position_ids.max().item()) + 1)
@@ -1161,7 +1180,7 @@ class Emu3Model(Emu3PreTrainedModel):
             use_legacy_cache = not isinstance(past_key_values, Cache)
             if use_legacy_cache:
                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-            past_key_values_length = past_key_values.get_usable_length(seq_length)
+            past_key_values_length = _get_usable_cache_length(past_key_values, seq_length)
 
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device

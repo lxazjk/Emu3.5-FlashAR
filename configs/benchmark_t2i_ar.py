@@ -18,9 +18,9 @@ def _env_float(name: str, default: float) -> float:
 
 model_path = os.getenv("EMU35_IMAGE_MODEL_PATH", "./weights/Emu3.5-Image")
 vq_path = os.getenv("EMU35_VQ_PATH", "./weights/Emu3.5-VisionTokenizer")
-nar_ckpt_path = ""
-nar_use_vertical_block = False
-nar_vertical_layers = 0
+flashar_ckpt_path = ""
+flashar_use_vertical_block = False
+flashar_vertical_layers = 0
 
 tokenizer_path = "./src/tokenizer_emu3_ibq"
 vq_type = "ibq"

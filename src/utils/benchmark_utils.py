@@ -11,7 +11,7 @@ from typing import Any, Dict
 import torch
 from PIL import Image
 
-from emu_nar.utils.text_utils import build_image_prefix_tokens
+from flashar.utils.text_utils import build_image_prefix_tokens
 from src.utils.generation_utils import multimodal_decode
 
 
@@ -101,7 +101,7 @@ def save_image(image: Image.Image, out_path: str) -> None:
     image.save(out_path)
 
 
-def decode_nar_grid_to_image(
+def decode_flashar_grid_to_image(
     *,
     vq_model: Any,
     grid: torch.Tensor,
