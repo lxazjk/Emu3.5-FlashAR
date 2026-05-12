@@ -1,0 +1,101 @@
+{
+  "launcher": {
+    "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+    "pytorch_alloc_conf": "expandable_segments:True",
+    "nproc_per_node": 8,
+    "standalone": true
+  },
+  "paths": {
+    "model_path": "./weights/Emu3.5-Image",
+    "tokenizer_path": "./src/tokenizer_emu3_ibq",
+    "vq_path": "./weights/Emu3.5-VisionTokenizer",
+    "save_dir": "./outputs/flashar_finetune",
+    "resume_path": ""
+  },
+  "data": {
+    "vq_type": "ibq",
+    "pretok_glob": "./data/GPT4o-Image_pretok_32/text_to_image_partfirst/*.tar",
+    "text_template": "<|extra_203|>You are a helpful assistant for t2i task. USER: {text} ASSISTANT: <|extra_100|>",
+    "text_max_length": 128,
+    "add_boi": true,
+    "seed": 1234,
+    "batch_size": 1,
+    "num_workers": 16,
+    "shuffle": true
+  },
+  "runtime": {
+    "device": "cuda:0",
+    "dtype": "bf16",
+    "low_cpu_mem_usage": true,
+    "fsdp_use_orig_params": true,
+    "fsdp_min_params": 1000000,
+    "fsdp_wrap_policy": "transformer",
+    "fsdp_cpu_offload": false,
+    "fsdp_no_sync": false,
+    "gradient_checkpointing": true,
+    "prefetch_factor": 4,
+    "persistent_workers": true,
+    "pin_memory": true
+  },
+  "model": {
+    "visual_token_offset": -1,
+    "visual_vocab_size": 131072,
+    "use_vertical_block": true,
+    "vertical_layers": 4,
+    "vertical_start_layer": -1
+  },
+  "optimization": {
+    "epochs": 20,
+    "max_steps": 20000,
+    "lr": 5e-05,
+    "backbone_lr": 0.0,
+    "backbone_lr_factor": 0.2,
+    "grad_clip": 0.0,
+    "grad_accum_steps": 1,
+    "train_backbone": true,
+    "vertical_head_warmup_steps": 1000,
+    "ar_distill_weight": 0.2,
+    "ar_distill_temperature": 2.0,
+    "phase2_lr_factor": 0.35,
+    "lr_scheduler": "cosine",
+    "lr_min_factor": 0.05,
+    "phase1_flat_steps": 500,
+    "phase2_flat_steps": 2000,
+    "aux_loss_h_weight": 0.0,
+    "aux_loss_v_weight": 0.05,
+    "gate_collapse_weight": 0.0
+  },
+  "checkpointing": {
+    "fresh_run": false,
+    "save_latest_only": true,
+    "save_every_steps": 200,
+    "save_full_state": true,
+    "save_epoch": "full",
+    "hf_max_shard_size": "5GB"
+  },
+  "eval": {
+    "eval_generate_prompt": "A futuristic cyberpunk city street during heavy rain at night. Neon signs in pink and cyan reflect on the wet pavement. A lone samurai with a glowing katana stands in the foreground, wearing a high-tech armored trench coat. Towering skyscrapers disappear into the mist above. Cinematic composition, dramatic lighting, ray tracing, highly detailed, photorealistic, 8k resolution, cyberpunk aesthetic, Blade Runner style, sharp focus, volumetric lighting.",
+    "eval_generate_height": 32,
+    "eval_generate_width": 32,
+    "eval_generate_outdir": "",
+    "eval_generate_decode": true,
+    "eval_generate_temperature": 1.0,
+    "eval_generate_top_k": 0,
+    "eval_generate_top_p": 1.0,
+    "eval_generate_cfg_scale": 2.5,
+    "eval_generate_sample": true,
+    "eval_generate_device": "cuda:0",
+    "eval_generate_every_steps": 200,
+    "eval_generate_timing": "none",
+    "eval_generate_seed": 42
+  },
+  "logging": {
+    "log_every_steps": 10,
+    "wandb": false,
+    "wandb_project": "flashar",
+    "wandb_entity": "",
+    "wandb_name": "",
+    "wandb_mode": "online",
+    "wandb_log_interval": 10
+  }
+}

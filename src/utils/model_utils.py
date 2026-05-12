@@ -8,17 +8,17 @@ from typing import Any
 
 import torch
 
-from emu_nar.model import EmuNAR
-from emu_nar.utils.text_utils import build_text_tokenizer as _build_text_tokenizer
+from flashar.model import Emuflashar
+from flashar.utils.text_utils import build_text_tokenizer as _build_text_tokenizer
 
 from ..emu3p5 import Emu3Config, Emu3ForCausalLM
 from ..emu3p5.modeling_emu3 import Emu3Model
 from ..vision_tokenizer import build_vision_tokenizer
-from .nar_checkpoint_utils import (
+from .flashar_checkpoint_utils import (
     infer_vertical_from_state as _infer_vertical_from_state,
+    load_flashar_metadata as _load_flashar_metadata,
     load_state_with_allowed_missing as _load_state_with_allowed_missing,
-    load_nar_metadata as _load_nar_metadata,
-    resolve_nar_ckpt_path as _resolve_nar_ckpt_path,
+    resolve_flashar_ckpt_path as _resolve_flashar_ckpt_path,
     safe_torch_load as _safe_torch_load,
 )
 
@@ -64,11 +64,11 @@ def build_emu3p5(
         model_path,
         trust_remote_code=True,
     )
-    nar_ckpt_path = kwargs.pop("nar_ckpt_path", "")
-    nar_enabled = bool(nar_ckpt_path)
+    flashar_ckpt_path = kwargs.pop("flashar_ckpt_path", "")
+    flashar_enabled = bool(flashar_ckpt_path)
     attn_impl = kwargs.pop("attn_implementation", None)
     if attn_impl is None:
-        attn_impl = "eager" if nar_enabled else "flash_attention_2"
+        attn_impl = "eager" if flashar_enabled else "flash_attention_2"
     model, loading_info = Emu3ForCausalLM.from_pretrained(
         model_path,
         config=model_config,
@@ -98,22 +98,22 @@ def build_emu3p5(
     return model, tokenizer, vq_model
 
 
-def build_emu3p5_nar_inference(
+def build_emu3p5_flashar_inference(
     model_path,
     tokenizer_path,
     vq_path,
-    nar_ckpt_path,
+    flashar_ckpt_path,
     vq_type="ibq",
     model_device="cuda:0",
     vq_device="cuda:0",
-    nar_use_vertical_block=None,
-    nar_vertical_layers=0,
-    nar_vertical_start_layer=-1,
-    nar_attn_implementation="eager",
-    nar_merge_dtype="bf16",
-    nar_fsdp_wrap_policy="transformer",
-    nar_fsdp_min_params=1_000_000,
-    nar_split_backbone=False,
+    flashar_use_vertical_block=None,
+    flashar_vertical_layers=0,
+    flashar_vertical_start_layer=-1,
+    flashar_attn_implementation="eager",
+    flashar_merge_dtype="bf16",
+    flashar_fsdp_wrap_policy="transformer",
+    flashar_fsdp_min_params=1_000_000,
+    flashar_split_backbone=False,
     **kwargs,
 ):
     _validate_model_path(model_path)
@@ -123,90 +123,90 @@ def build_emu3p5_nar_inference(
         device_map = model_device
 
     print(device_map)
-    print("[NAR-LOAD] resolving checkpoint path", flush=True)
-    resolved_ckpt_path = _resolve_nar_ckpt_path(
-        nar_ckpt_path=nar_ckpt_path,
+    print("[flashar-LOAD] resolving checkpoint path", flush=True)
+    resolved_ckpt_path = _resolve_flashar_ckpt_path(
+        flashar_ckpt_path=flashar_ckpt_path,
         model_path=model_path,
-        merge_dtype=nar_merge_dtype,
-        fsdp_wrap_policy=nar_fsdp_wrap_policy,
-        fsdp_min_params=nar_fsdp_min_params,
-        use_vertical_block=nar_use_vertical_block,
-        vertical_layers=nar_vertical_layers,
+        merge_dtype=flashar_merge_dtype,
+        fsdp_wrap_policy=flashar_fsdp_wrap_policy,
+        fsdp_min_params=flashar_fsdp_min_params,
+        use_vertical_block=flashar_use_vertical_block,
+        vertical_layers=flashar_vertical_layers,
     )
-    print(f"[NAR-LOAD] loading checkpoint from {resolved_ckpt_path}", flush=True)
+    print(f"[flashar-LOAD] loading checkpoint from {resolved_ckpt_path}", flush=True)
     state = _safe_torch_load(resolved_ckpt_path, mmap=True)
-    nar_metadata = _load_nar_metadata(resolved_ckpt_path)
-    print("[NAR-LOAD] checkpoint deserialized on CPU", flush=True)
+    flashar_metadata = _load_flashar_metadata(resolved_ckpt_path)
+    print("[flashar-LOAD] checkpoint deserialized on CPU", flush=True)
 
     inferred_use_vertical, inferred_vertical_layers = _infer_vertical_from_state(state)
-    if nar_use_vertical_block is None:
+    if flashar_use_vertical_block is None:
         use_vertical_block = inferred_use_vertical
     else:
-        use_vertical_block = bool(nar_use_vertical_block)
-    if int(nar_vertical_layers) > 0:
-        vertical_layers = int(nar_vertical_layers)
+        use_vertical_block = bool(flashar_use_vertical_block)
+    if int(flashar_vertical_layers) > 0:
+        vertical_layers = int(flashar_vertical_layers)
     elif inferred_vertical_layers > 0:
         vertical_layers = inferred_vertical_layers
     else:
         vertical_layers = 1 if use_vertical_block else 0
     backbone_state = {}
-    nar_head_state = {}
+    flashar_head_state = {}
     for key, value in state.items():
         if key.startswith("backbone."):
             backbone_state[key[len("backbone."):]] = value
         else:
-            nar_head_state[key] = value
+            flashar_head_state[key] = value
     print(
-        f"[NAR-LOAD] split state dict: backbone={len(backbone_state)} nar={len(nar_head_state)}",
+        f"[flashar-LOAD] split state dict: backbone={len(backbone_state)} flashar={len(flashar_head_state)}",
         flush=True,
     )
 
-    if nar_attn_implementation == "flash_attention_2":
+    if flashar_attn_implementation == "flash_attention_2":
         print(
-            "[NAR-LOAD] flash_attention_2 is temporarily disabled for NAR inference; falling back to eager.",
+            "[flashar-LOAD] flash_attention_2 is temporarily disabled for flashar inference; falling back to eager.",
             flush=True,
         )
-        nar_attn_implementation = "eager"
+        flashar_attn_implementation = "eager"
 
     model_config = Emu3Config.from_pretrained(
         model_path,
         trust_remote_code=True,
     )
-    if int(nar_vertical_start_layer) >= 0:
-        vertical_start_layer = int(nar_vertical_start_layer)
-    elif "vertical_start_layer" in nar_metadata:
-        vertical_start_layer = int(nar_metadata["vertical_start_layer"])
+    if int(flashar_vertical_start_layer) >= 0:
+        vertical_start_layer = int(flashar_vertical_start_layer)
+    elif "vertical_start_layer" in flashar_metadata:
+        vertical_start_layer = int(flashar_metadata["vertical_start_layer"])
     else:
         vertical_start_layer = int(model_config.num_hidden_layers)
-    model_config._attn_implementation = nar_attn_implementation
+    model_config._attn_implementation = flashar_attn_implementation
     # Avoid Transformers' flex-attention architecture allowlist check by
     # constructing the model directly and loading the already-extracted
-    # backbone state from the dedicated NAR inference checkpoint.
+    # backbone state from the dedicated flashar inference checkpoint.
     if device_map == "auto":
         target_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     else:
         target_device = torch.device(device_map)
 
     print(
-        f"[NAR-LOAD] instantiating backbone on {target_device} with dtype={torch.bfloat16}",
+        f"[flashar-LOAD] instantiating backbone on {target_device} with dtype={torch.bfloat16}",
         flush=True,
     )
     backbone = Emu3Model(model_config)
     backbone = backbone.to(device=target_device, dtype=torch.bfloat16)
-    print("[NAR-LOAD] loading backbone weights", flush=True)
+    print("[flashar-LOAD] loading backbone weights", flush=True)
     incompat = backbone.load_state_dict(backbone_state, strict=True)
     missing = list(getattr(incompat, "missing_keys", []))
     unexpected = list(getattr(incompat, "unexpected_keys", []))
     if missing or unexpected:
         raise RuntimeError(
-            "NAR backbone load got unexpected mismatch. "
+            "flashar backbone load got unexpected mismatch. "
             f"missing_keys={missing} unexpected_keys={unexpected}"
         )
     backbone.eval()
-    print("[NAR-LOAD] backbone ready", flush=True)
+    print("[flashar-LOAD] backbone ready", flush=True)
 
-    print("[NAR-LOAD] building NAR wrapper", flush=True)
-    wrapper = EmuNAR(
+    print("[flashar-LOAD] building flashar wrapper", flush=True)
+    wrapper = Emuflashar(
         pretrained_backbone=backbone,
         vocab_size=model_config.vocab_size,
         hidden_size=model_config.hidden_size,
@@ -217,78 +217,19 @@ def build_emu3p5_nar_inference(
         vertical_layers=max(1, vertical_layers) if use_vertical_block else 0,
         vertical_start_layer=vertical_start_layer,
         lm_head=None,
-        split_backbone=bool(nar_split_backbone),
+        split_backbone=bool(flashar_split_backbone),
     )
-    print("[NAR-LOAD] loading NAR head weights", flush=True)
+    print("[flashar-LOAD] loading flashar head weights", flush=True)
     _load_state_with_allowed_missing(
         wrapper,
-        nar_head_state,
-        load_desc="load NAR head state",
+        flashar_head_state,
+        load_desc="load flashar head state",
         allowed_missing_prefixes=("backbone.",),
     )
     wrapper = wrapper.to(next(backbone.parameters()).device)
     wrapper.eval()
-    print("[NAR-LOAD] wrapper ready", flush=True)
+    print("[flashar-LOAD] wrapper ready", flush=True)
 
     tokenizer = _build_text_tokenizer(tokenizer_path)
     vq_model = build_vision_tokenizer(vq_type, vq_path, device=vq_device, **kwargs)
     return wrapper, tokenizer, vq_model, resolved_ckpt_path
-
-
-def build_emu3p5_vllm(
-    model_path,
-    tokenizer_path,
-    vq_path,
-    vq_type="ibq",
-    vq_device="cuda:0",
-    tensor_parallel_size=1,
-    gpu_memory_utilization=0.7,
-    seed=6666,
-    **kwargs,
-):
-    from vllm import LLM
-
-    # text tokenizer
-    tokenizer = _build_text_tokenizer(tokenizer_path)
-
-    # vq tokenizer
-    vq_model = build_vision_tokenizer(vq_type, vq_path, device=vq_device, **kwargs)
-
-    # resolution tokens
-    resolution_map = {}
-    resolution_str = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "*"]
-    for digit_str in resolution_str:
-        resolution_map[tokenizer.encode(digit_str)[0]] = digit_str
-
-    model = LLM(
-        model_path,
-        tokenizer=tokenizer_path,
-        trust_remote_code=True,
-        dtype="auto",
-        tensor_parallel_size=tensor_parallel_size,
-        gpu_memory_utilization=gpu_memory_utilization,
-        disable_log_stats=False,
-        enable_chunked_prefill=False,
-        enable_prefix_caching=False,
-        max_num_batched_tokens=26000,
-        max_num_seqs=2,
-        seed=seed,
-        generation_config='vllm',
-        scheduler_cls="vllm.v1.core.sched.batch_scheduler.Scheduler",
-        compilation_config={
-            "full_cuda_graph": True,
-            "backend": "cudagraph",
-            "cudagraph_capture_sizes": [1, 2],
-        },
-        additional_config={
-            "boi_token_id": tokenizer.encode("<|image start|>")[0],
-            "soi_token_id": tokenizer.encode("<|image token|>")[0],
-            "eol_token_id": tokenizer.encode("<|extra_200|>")[0],
-            "eoi_token_id": tokenizer.encode("<|image end|>")[0],
-            "resolution_map": resolution_map,
-        },
-    )
-    model.set_tokenizer(tokenizer)
-    print(f"{model.llm_engine.vllm_config=}")
-
-    return model, tokenizer, vq_model

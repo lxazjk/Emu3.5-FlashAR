@@ -18,9 +18,17 @@ def _env_float(name: str, default: float) -> float:
 
 model_path = os.getenv("EMU35_IMAGE_MODEL_PATH", "./weights/Emu3.5-Image")
 vq_path = os.getenv("EMU35_VQ_PATH", "./weights/Emu3.5-VisionTokenizer")
-flashar_ckpt_path = ""
-flashar_use_vertical_block = False
-flashar_vertical_layers = 0
+flashar_ckpt_path = os.getenv(
+    "EMU35_BENCH_FLASHAR_CKPT",
+    "./outputs/flashar_finetune/flashar_final",
+)
+flashar_use_vertical_block = True
+flashar_vertical_layers = _env_int("EMU35_FLASHAR_VERTICAL_LAYERS", 2)
+flashar_vertical_start_layer = _env_int("EMU35_FLASHAR_VERTICAL_START_LAYER", -1)
+flashar_attn_implementation = os.getenv("EMU35_FLASHAR_ATTN_IMPL", "eager")
+flashar_merge_dtype = os.getenv("EMU35_FLASHAR_MERGE_DTYPE", "bf16")
+flashar_fsdp_wrap_policy = os.getenv("EMU35_FLASHAR_FSDP_WRAP_POLICY", "transformer")
+flashar_fsdp_min_params = _env_int("EMU35_FLASHAR_FSDP_MIN_PARAMS", 1_000_000)
 
 tokenizer_path = "./src/tokenizer_emu3_ibq"
 vq_type = "ibq"
@@ -28,7 +36,7 @@ vq_type = "ibq"
 task_type = "t2i"
 use_image = False
 
-exp_name = os.getenv("EMU35_BENCH_EXP_NAME", "emu3p5_benchmark_ar")
+exp_name = os.getenv("EMU35_BENCH_EXP_NAME", "flashar_benchmark")
 save_path = os.getenv("EMU35_BENCH_SAVE_PATH", f"./outputs/{exp_name}")
 save_to_proto = True
 setup_logger(save_path)

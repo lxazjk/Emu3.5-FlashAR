@@ -5,12 +5,12 @@ set -euo pipefail
 : "${MODEL_PATH:=./weights/Emu3.5-Image}"
 : "${TOKENIZER_PATH:=./src/tokenizer_emu3_ibq}"
 : "${VQ_PATH:=./weights/Emu3.5-VisionTokenizer}"
-: "${CKPT_PATH:=./outputs/nar_finetune/nar_final}"
+: "${CKPT_PATH:=./outputs/flashar_finetune/flashar_final}"
 : "${HEIGHT:=32}"
 : "${WIDTH:=32}"
 : "${PROMPT:=a pig}"
 : "${TEXT_TEMPLATE:=<|extra_203|>You are a helpful assistant for t2i task. USER: {text} ASSISTANT: <|extra_100|>}"
-: "${OUT_PATH:=./nar_out.png}"
+: "${OUT_PATH:=./flashar_out.png}"
 : "${DTYPE:=bf16}"
 : "${TEMPERATURE:=1.0}"
 : "${TOP_K:=0}"
@@ -22,7 +22,7 @@ set -euo pipefail
 : "${SPLIT_BACKBONE:=0}"
 
 CMD=(
-  "${PYTHON_BIN}" generate_neighbor_ar.py
+  "${PYTHON_BIN}" generate_flashar.py
   --model_path "${MODEL_PATH}"
   --tokenizer_path "${TOKENIZER_PATH}"
   --vq_path "${VQ_PATH}"

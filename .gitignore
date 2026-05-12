@@ -13,12 +13,21 @@ wheels/
 
 ### Environments
 .env
-.venv
+.env.*
+.venv/
+.venv-*/
 env/
 venv/
+conda/
 
 ### Notebooks
 .ipynb_checkpoints/
+
+### Caches
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 ### IDE
 .vscode/
@@ -32,14 +41,28 @@ venv/
 Thumbs.db
 
 ### Project outputs and large artifacts
-outputs/
-logs/
-video_outputs/
-video_case/
-checkpoints/
-weights/
+/outputs/
+/output/
+/logs/
+/video_outputs/
+/video_case/
+/checkpoints/
+/weights/
+/runs/
+/tb_logs/
+/tensorboard/
+/lightning_logs/
+/flashar_final*/
+/*_final_*/
+/nar_final_78/
+/wandb/
 *.log
+*.out
+*.err
+*.pid
+nohup.out
 *.mp4
+*.jsonl
 
 ### Model files (large)
 *.bin
@@ -48,21 +71,36 @@ weights/
 *.ckpt
 *.pt
 *.pth
+*.onnx
+*.gguf
+*.npy
+*.npz
+*.pkl
+*.pickle
 
 ### Temp
 tmp/
 temp/
+*.tmp
 _trash/
 
-### Notes
-emu*.md
-output_image/
-*log*
-### Dataset
-Infinity-MM/
-GPT4o-Image/
-# GPT4o-Image_pretok_32/
+### Local datasets and pretokenized shards
+/data/
+/datasets/
+/Infinity-MM/
+/geneval/
+/GPT4o-Image*/
+/OpenGPT-4o-Image/
+/OpenGPT4o-Image_pretok_32/
+*.tar
+*.tar.gz
+*.tar.gz.*
 
-.*
-*.png
-wandb/
+### Local experiment configs
+/configs/*.local.json
+/configs/train_flashar_resume_opengpt4o_gen.json
+/configs/*resume*.json
+
+### Third-party checkouts downloaded for local evaluation
+/third_party/mmdetection/
+/third_party/mmdetection3/
