@@ -1,10 +1,14 @@
+<div align="center">
+
 # FlashAR
 
-**Efficient Post-Training Acceleration for Autoregressive Image Generation**
+### Efficient Post-Training Acceleration for Autoregressive Image Generation
 
 [![arXiv](https://img.shields.io/badge/arXiv-2605.09430-b31b1b.svg)](https://arxiv.org/abs/2605.09430)
 [![Project](https://img.shields.io/badge/Project-Page-blue)](https://lxazjk.github.io/FlashAR/)
 [![License](https://img.shields.io/badge/License-Apache--2.0-green.svg)](LICENSE)
+
+</div>
 
 This repository contains the Emu3.5-Image implementation of FlashAR. It provides
 the code needed to:
@@ -19,21 +23,7 @@ the code needed to:
   <img src="assets/teaser.png" width="95%" alt="Generated samples from FlashAR">
 </p>
 
-## Paper
-
-**FlashAR: Efficient Post-Training Acceleration for Autoregressive Image Generation**
-
-Junkang Zhou*, Yefei He*, Feng Chen*, Weijie Wang, Bohan Zhuang
-
-Zhejiang University and University of Adelaide
-
-Links:
-
-- Paper: [arXiv:2605.09430](https://arxiv.org/abs/2605.09430)
-- LlamaGen-Flash code: [lxazjk/LlamaGen-Flash](https://github.com/lxazjk/LlamaGen-Flash)
-- Emu3.5-Flash code: [lxazjk/Emu3.5-Flash](https://github.com/lxazjk/Emu3.5-Flash)
-- LlamaGen-Flash weights: [Hugging Face](https://huggingface.co/lxazjk/LlamaGen-Flash)
-- Emu3.5-Image-Flash weights: [Hugging Face](https://huggingface.co/lxazjk/Emu3.5-Image-Flash)
+## Overview
 
 FlashAR accelerates a pretrained raster-scan autoregressive image generator by
 adding a vertical prediction branch and a learnable fusion gate. Decoding then
