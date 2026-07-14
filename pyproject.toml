@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flashar"
+version = "0.1.0"
+description = "Efficient Post-Training Acceleration for Autoregressive Image Generation (Emu3.5-Image)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Junkang Zhou" },
+    { name = "Yefei He" },
+    { name = "Feng Chen" },
+    { name = "Weijie Wang" },
+    { name = "Bohan Zhuang" },
+]
+keywords = [
+    "autoregressive",
+    "image-generation",
+    "diffusion",
+    "multimodal",
+    "emu3",
+    "acceleration",
+]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Mirrors requirements/transformers.txt (+ requirements/common.txt).
+# The requirements/*.txt files remain the canonical install path used in the README.
+dependencies = [
+    "torch>=2.6.0",
+    "torchvision>=0.15.0",
+    "torchaudio>=2.0.0",
+    "transformers==4.48.2",
+    "accelerate>=0.20.0",
+    "pillow>=9.0.0",
+    "numpy>=1.21.0",
+    "tqdm>=4.64.0",
+    "protobuf>=3.20.0",
+    "tiktoken>=0.12.0",
+    "imageio==2.37.0",
+    "imageio-ffmpeg==0.6.0",
+    "omegaconf==2.3.0",
+]
+
+[project.urls]
+Homepage = "https://lxazjk.github.io/FlashAR/"
+Paper = "https://arxiv.org/abs/2605.09430"
+Checkpoint = "https://huggingface.co/lxazjk/Emu3.5-Image-FlashAR"
+
+# flash_attn is intentionally omitted: it must be installed separately with
+# `pip install flash_attn==2.8.3 --no-build-isolation` (see README).
+
+[tool.setuptools.packages.find]
+# Both top-level packages are kept as-is. `src` has no __init__.py (PEP 420
+# namespace package); with namespaces=true an editable install resolves
+# `import src.*` and `import flashar.*` from the repo root without copying a
+# `src` directory into site-packages.
+include = ["flashar*", "src*"]
+namespaces = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]  # line length handled by the formatter, not enforced hard
