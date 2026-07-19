@@ -1,3 +1,5 @@
+> **🔦 FlashAR 系列** — [📄 项目主页](https://lxazjk.github.io/FlashAR/) · [论文](https://arxiv.org/abs/2605.09430) · **⚡ Emu3.5-FlashAR(👈 你在这 · 主实现)** · [LlamaGen-FlashAR](https://github.com/lxazjk/LlamaGen-FlashAR) · [项目主页仓库](https://github.com/lxazjk/FlashAR)
+
 <div align='center'>
 <h1>⚡ FlashAR</h1>
 
@@ -290,3 +292,17 @@ tokenization.sh     pretokenization launcher
 ```
 
 FlashAR builds on [Emu3.5](https://github.com/baaivision/Emu3.5) by BAAI.
+
+
+## 🔦 FlashAR 系列 / 相关仓库
+
+FlashAR 是一套针对不同自回归(AR)图像生成骨干的加速实现。本仓库(Emu3.5-FlashAR)为主实现:
+
+| 仓库 | 内容 |
+|---|---|
+| [**⚡ Emu3.5-FlashAR**](https://github.com/lxazjk/Emu3.5-FlashAR)(本仓库) | Emu3.5-Image 参考实现(旗舰) |
+| [LlamaGen-FlashAR](https://github.com/lxazjk/LlamaGen-FlashAR) | LlamaGen / ImageNet 类条件实现 |
+| [FlashAR](https://github.com/lxazjk/FlashAR) | 项目主页 / 网站源码 |
+
+- 📄 项目主页:https://lxazjk.github.io/FlashAR/
+- 📝 论文:https://arxiv.org/abs/2605.09430
