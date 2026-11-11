@@ -84,7 +84,7 @@ def load_model(args):
         args.model_path,
         config=cfg,
         torch_dtype=torch_dtype,
-        attn_implementation="eager",
+        attn_implementation="sdpa",
     ).to(device)
     backbone.eval()
 

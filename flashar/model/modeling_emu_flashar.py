@@ -25,6 +25,10 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import functional as F
 from transformers.cache_utils import DynamicCache
+if not hasattr(DynamicCache, "seen_tokens"):
+    DynamicCache.seen_tokens = property(lambda self: self.get_seq_length())
+if not hasattr(DynamicCache, "get_max_length"):
+    DynamicCache.get_max_length = lambda self: None
 
 
 # ============================================================================
@@ -64,18 +68,21 @@ def _sample_logits(
     top_p: float = 1.0,
     sample_logits: bool = True,
 ) -> torch.Tensor:
-    idx = []
-    for i in range(logits.shape[1]):
-        one_logits = logits[:, i, :] / max(temperature, 1e-5)
-        if top_k > 0 or top_p < 1.0:
-            one_logits = _top_k_top_p_filtering(one_logits, top_k=top_k, top_p=top_p)
-        probs = F.softmax(one_logits, dim=-1)
-        if sample_logits:
-            one_idx = torch.multinomial(probs, num_samples=1)
-        else:
-            _, one_idx = torch.topk(probs, k=1, dim=-1)
-        idx.append(one_idx.view(-1, 1))
-    return torch.cat(idx, dim=-1)
+    if not sample_logits:
+        return torch.argmax(logits, dim=-1)
+    bsz, seq_len, vocab = logits.shape
+    flat = (logits.float() / max(temperature, 1e-5)).reshape(bsz * seq_len, vocab)
+    if top_k > 0 and top_p >= 1.0:
+        k = min(int(top_k), vocab)
+        topk_vals, topk_idx = torch.topk(flat, k, dim=-1)
+        probs = F.softmax(topk_vals, dim=-1)
+        picked = torch.multinomial(probs, num_samples=1)
+        return topk_idx.gather(-1, picked).view(bsz, seq_len)
+    if top_k > 0 or top_p < 1.0:
+        flat = _top_k_top_p_filtering(flat, top_k=top_k, top_p=top_p)
+    probs = F.softmax(flat, dim=-1)
+    sampled = torch.multinomial(probs, num_samples=1)
+    return sampled.view(bsz, seq_len)
 
 
 # ============================================================================
@@ -278,9 +285,12 @@ class Emuflashar(nn.Module):
                     ]
                 ]
             )
-            for layer in self.vertical_block:
-                if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "is_causal"):
-                    layer.self_attn.is_causal = False
+            for v_idx, layer in enumerate(self.vertical_block):
+                if hasattr(layer, "self_attn"):
+                    if hasattr(layer.self_attn, "is_causal"):
+                        layer.self_attn.is_causal = False
+                    if hasattr(layer.self_attn, "layer_idx"):
+                        layer.self_attn.layer_idx = v_idx
             rms_eps = float(getattr(cfg, "rms_norm_eps", 1e-6))
             from src.emu3p5.modeling_emu3 import Emu3RMSNorm
 
@@ -1421,6 +1431,266 @@ class Emuflashar(nn.Module):
             )
         return current_h_hidden, current_v_input_hidden, outputs.past_key_values
 
+    @contextmanager
+    def _fast_decode_context(self, max_seq_len: int = 2048):
+        all_layers = list(getattr(self.backbone, "layers", []))
+        if self.vertical_block is not None:
+            all_layers.extend(list(self.vertical_block))
+        saved_forwards = []
+        from src.emu3p5.modeling_emu3 import apply_rotary_pos_emb, repeat_kv
+        dummy = next(self.backbone.parameters())[:1, :1]
+        for layer in all_layers:
+            self_attn = getattr(layer, "self_attn", None)
+            if self_attn is None or not hasattr(self_attn, "rotary_emb"):
+                continue
+            self_attn.rotary_emb(dummy, seq_len=max_seq_len)
+            orig_fwd = self_attn.forward
+            saved_forwards.append((self_attn, orig_fwd))
+
+            def _make_fast_fwd(attn_mod):
+                def _fast_fwd(
+                    hidden_states: torch.Tensor,
+                    attention_mask: Optional[torch.Tensor] = None,
+                    position_ids: Optional[torch.LongTensor] = None,
+                    past_key_value: Optional[DynamicCache] = None,
+                    output_attentions: bool = False,
+                    use_cache: bool = False,
+                    **kwargs,
+                ):
+                    bsz, q_len, _ = hidden_states.size()
+                    qkv_w = getattr(attn_mod, "_fused_qkv_weight", None)
+                    if qkv_w is not None:
+                        q_sz = attn_mod.num_heads * attn_mod.head_dim
+                        kv_sz = attn_mod.num_key_value_heads * attn_mod.head_dim
+                        qkv = F.linear(hidden_states, qkv_w)
+                        query_states, key_states, value_states = torch.split(qkv, [q_sz, kv_sz, kv_sz], dim=-1)
+                    else:
+                        query_states = attn_mod.q_proj(hidden_states)
+                        key_states = attn_mod.k_proj(hidden_states)
+                        value_states = attn_mod.v_proj(hidden_states)
+
+                    query_states = attn_mod.q_norm(query_states.view(bsz, q_len, attn_mod.num_heads, attn_mod.head_dim)).transpose(1, 2)
+                    key_states = attn_mod.k_norm(key_states.view(bsz, q_len, attn_mod.num_key_value_heads, attn_mod.head_dim)).transpose(1, 2)
+                    value_states = value_states.view(bsz, q_len, attn_mod.num_key_value_heads, attn_mod.head_dim).transpose(1, 2)
+
+                    cos, sin = attn_mod.rotary_emb(value_states, seq_len=max_seq_len)
+                    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+                    if past_key_value is not None:
+                        key_states, value_states = past_key_value.update(key_states, value_states, attn_mod.layer_idx)
+
+                    key_states = repeat_kv(key_states, attn_mod.num_key_value_groups)
+                    value_states = repeat_kv(value_states, attn_mod.num_key_value_groups)
+
+                    attn_output = F.scaled_dot_product_attention(
+                        query_states,
+                        key_states,
+                        value_states,
+                        attn_mask=attention_mask,
+                        dropout_p=0.0,
+                        is_causal=bool(getattr(attn_mod, "is_causal", False)) and attention_mask is None and q_len > 1,
+                    )
+                    attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
+                    attn_output = attn_mod.o_proj(attn_output)
+                    return attn_output, None, past_key_value
+
+                return _fast_fwd
+
+            self_attn.forward = _make_fast_fwd(self_attn)
+        try:
+            yield
+        finally:
+            for self_attn, orig_fwd in saved_forwards:
+                self_attn.forward = orig_fwd
+
+    def _init_fused_branches(self) -> None:
+        if getattr(self, "_fused_branches_ready", False):
+            return
+        if self.vertical_block is None or len(self.vertical_block) == 0:
+            self._fused_branches_ready = False
+            return
+
+        vo = int(self.visual_token_offset) if (self.visual_token_offset is not None and self.visual_token_offset > 0) else 0
+        w_h = self.horizontal_head.weight[vo:]
+        w_v = self.vertical_head.weight[vo:]
+        # Shape: [2, hidden_size, out_vocab] for single torch.bmm
+        self._fused_head_weight = torch.stack([w_h.t().contiguous(), w_v.t().contiguous()], dim=0).contiguous()
+
+        h_layers = [
+            self.backbone.layers[self.vertical_start_layer + i]
+            for i in range(self.vertical_layers)
+        ]
+        v_layers = list(self.vertical_block)
+
+        fused_layers = []
+        for i, (hl, vl) in enumerate(zip(h_layers, v_layers)):
+            ha, va = hl.self_attn, vl.self_attn
+            h_qkv = torch.cat([ha.q_proj.weight, ha.k_proj.weight, ha.v_proj.weight], dim=0).t().contiguous()
+            v_qkv = torch.cat([va.q_proj.weight, va.k_proj.weight, va.v_proj.weight], dim=0).t().contiguous()
+            w_qkv_t = torch.stack([h_qkv, v_qkv], dim=0).contiguous()
+
+            w_o_t = torch.stack([ha.o_proj.weight.t().contiguous(), va.o_proj.weight.t().contiguous()], dim=0).contiguous()
+
+            hm, vm = hl.mlp, vl.mlp
+            h_gu = torch.cat([hm.gate_proj.weight, hm.up_proj.weight], dim=0).t().contiguous()
+            v_gu = torch.cat([vm.gate_proj.weight, vm.up_proj.weight], dim=0).t().contiguous()
+            w_gu_t = torch.stack([h_gu, v_gu], dim=0).contiguous()
+
+            w_down_t = torch.stack([hm.down_proj.weight.t().contiguous(), vm.down_proj.weight.t().contiguous()], dim=0).contiguous()
+
+            in_norm_w = torch.stack([hl.input_layernorm.weight, vl.input_layernorm.weight], dim=0).view(2, 1, 1, -1).contiguous()
+            post_norm_w = torch.stack([hl.post_attention_layernorm.weight, vl.post_attention_layernorm.weight], dim=0).view(2, 1, 1, -1).contiguous()
+            q_norm_w = torch.stack([ha.q_norm.weight, va.q_norm.weight], dim=0).view(2, 1, 1, 1, -1).contiguous()
+            k_norm_w = torch.stack([ha.k_norm.weight, va.k_norm.weight], dim=0).view(2, 1, 1, 1, -1).contiguous()
+
+            fused_layers.append(
+                {
+                    "h_layer_idx": int(ha.layer_idx),
+                    "v_layer_idx": int(i),
+                    "num_heads": int(ha.num_heads),
+                    "num_kv_heads": int(ha.num_key_value_heads),
+                    "num_kv_groups": int(ha.num_key_value_groups),
+                    "head_dim": int(ha.head_dim),
+                    "q_size": int(ha.num_heads * ha.head_dim),
+                    "kv_size": int(ha.num_key_value_heads * ha.head_dim),
+                    "eps": float(hl.input_layernorm.variance_epsilon),
+                    "q_eps": float(ha.q_norm.variance_epsilon),
+                    "rotary_emb": ha.rotary_emb,
+                    "w_qkv_t": w_qkv_t,
+                    "w_o_t": w_o_t,
+                    "w_gu_t": w_gu_t,
+                    "w_down_t": w_down_t,
+                    "in_norm_w": in_norm_w,
+                    "post_norm_w": post_norm_w,
+                    "q_norm_w": q_norm_w,
+                    "k_norm_w": k_norm_w,
+                }
+            )
+        self._fused_branch_layers = fused_layers
+        self._fused_final_norm_w = torch.stack(
+            [self.backbone.norm.weight, self.vertical_norm.weight], dim=0
+        ).view(2, 1, 1, -1).contiguous()
+        self._fused_final_norm_eps = float(self.backbone.norm.variance_epsilon)
+
+        # Also fuse QKV and Gate+Up in-place across shared backbone layers to reduce GEMM launches
+        for s_layer in self.backbone.layers[: self.vertical_start_layer]:
+            sa = s_layer.self_attn
+            if getattr(sa, "_fused_qkv_weight", None) is None and sa.q_proj is not None:
+                sa._fused_qkv_weight = torch.cat(
+                    [sa.q_proj.weight, sa.k_proj.weight, sa.v_proj.weight], dim=0
+                ).contiguous()
+                sa.q_proj = None
+                sa.k_proj = None
+                sa.v_proj = None
+            sm = s_layer.mlp
+            if getattr(sm, "_fused_gu_weight", None) is None and sm.gate_proj is not None:
+                sm._fused_gu_weight = torch.cat(
+                    [sm.gate_proj.weight, sm.up_proj.weight], dim=0
+                ).contiguous()
+                sm.gate_proj = None
+                sm.up_proj = None
+
+                def _make_fast_mlp_fwd(mlp_mod):
+                    def _fast_mlp_fwd(x: torch.Tensor) -> torch.Tensor:
+                        gate, up = F.linear(x, mlp_mod._fused_gu_weight).chunk(2, dim=-1)
+                        return mlp_mod.down_proj(mlp_mod.act_fn(gate) * up)
+
+                    return _fast_mlp_fwd
+
+                sm.forward = _make_fast_mlp_fwd(sm)
+
+        self._fused_branches_ready = True
+
+    @staticmethod
+    def _batched_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+        orig_dtype = x.dtype
+        xf = x.float()
+        var = xf.pow(2).mean(-1, keepdim=True)
+        return (xf * torch.rsqrt(var + eps)).to(orig_dtype) * weight
+
+    def _forward_fused_branches(
+        self,
+        shared_hidden: torch.Tensor,
+        step_positions: torch.Tensor,
+        prefix_len: int,
+        step_attn_mask: Optional[torch.Tensor],
+        backbone_cache: DynamicCache,
+        vertical_cache: DynamicCache,
+        max_seq_len: int = 2048,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        from src.emu3p5.modeling_emu3 import apply_rotary_pos_emb, repeat_kv
+
+        bsz, q_len, hidden_size = shared_hidden.shape
+        bq = bsz * q_len
+        hv_hidden = torch.stack([shared_hidden, shared_hidden], dim=0)  # [2, B, q_len, D]
+        pos_flat = (step_positions + int(prefix_len)).unsqueeze(0).expand(2 * bsz, -1)
+
+        for fl in self._fused_branch_layers:
+            eps = fl["eps"]
+            q_eps = fl["q_eps"]
+            n_heads = fl["num_heads"]
+            n_kv = fl["num_kv_heads"]
+            n_groups = fl["num_kv_groups"]
+            h_dim = fl["head_dim"]
+            q_sz = fl["q_size"]
+            kv_sz = fl["kv_size"]
+
+            # 1. Fused H+V Input RMSNorm + Fused H+V QKV bmm
+            normed = self._batched_rmsnorm(hv_hidden, fl["in_norm_w"], eps)
+            qkv = torch.bmm(normed.view(2, bq, hidden_size), fl["w_qkv_t"]).view(2, bsz, q_len, q_sz + 2 * kv_sz)
+            q, k, v = torch.split(qkv, [q_sz, kv_sz, kv_sz], dim=-1)
+
+            q = self._batched_rmsnorm(q.view(2, bsz, q_len, n_heads, h_dim), fl["q_norm_w"], q_eps).transpose(2, 3)
+            k = self._batched_rmsnorm(k.view(2, bsz, q_len, n_kv, h_dim), fl["k_norm_w"], q_eps).transpose(2, 3)
+            v = v.view(2, bsz, q_len, n_kv, h_dim).transpose(2, 3)
+
+            cos, sin = fl["rotary_emb"](v[0], seq_len=max_seq_len)
+            q_flat = q.view(2 * bsz, n_heads, q_len, h_dim)
+            k_flat = k.view(2 * bsz, n_kv, q_len, h_dim)
+            q_rot, k_rot = apply_rotary_pos_emb(q_flat, k_flat, cos, sin, pos_flat)
+            q_hv = q_rot.view(2, bsz, n_heads, q_len, h_dim)
+            k_hv = k_rot.view(2, bsz, n_kv, q_len, h_dim)
+
+            # Update H cache and V cache & run SDPA
+            kh_all, vh_all = backbone_cache.update(k_hv[0], v[0], fl["h_layer_idx"])
+            kv_all, vv_all = vertical_cache.update(k_hv[1], v[1], fl["v_layer_idx"])
+
+            kh_rep = repeat_kv(kh_all, n_groups)
+            vh_rep = repeat_kv(vh_all, n_groups)
+            kv_rep = repeat_kv(kv_all, n_groups)
+            vv_rep = repeat_kv(vv_all, n_groups)
+
+            attn_h = F.scaled_dot_product_attention(
+                q_hv[0], kh_rep, vh_rep, attn_mask=step_attn_mask, dropout_p=0.0, is_causal=False
+            )
+            attn_v = F.scaled_dot_product_attention(
+                q_hv[1], kv_rep, vv_rep, attn_mask=None, dropout_p=0.0, is_causal=False
+            )
+            attn_hv = torch.stack([attn_h, attn_v], dim=0).transpose(2, 3).contiguous().view(2, bq, q_sz)
+
+            # 2. Fused H+V o_proj bmm + residual
+            o_out = torch.bmm(attn_hv, fl["w_o_t"]).view(2, bsz, q_len, hidden_size)
+            hv_hidden = hv_hidden + o_out
+
+            # 3. Fused H+V Post-Attention RMSNorm + Fused H+V gate_up bmm + SiLU*up + down bmm
+            post_norm = self._batched_rmsnorm(hv_hidden, fl["post_norm_w"], eps)
+            gate_up = torch.bmm(post_norm.view(2, bq, hidden_size), fl["w_gu_t"])
+            gate, up = gate_up.chunk(2, dim=-1)
+            mlp_act = F.silu(gate) * up
+            down_out = torch.bmm(mlp_act, fl["w_down_t"]).view(2, bsz, q_len, hidden_size)
+            hv_hidden = hv_hidden + down_out
+
+        # 4. Fused Final Norm (backbone.norm + vertical_norm)
+        final_hv = self._batched_rmsnorm(hv_hidden, self._fused_final_norm_w, self._fused_final_norm_eps)
+        return final_hv[0], final_hv[1]
+
+    def _vertical_uses_sdpa_or_fa2(self) -> bool:
+        if self.vertical_block is None or len(self.vertical_block) == 0:
+            return False
+        first_attn = getattr(self.vertical_block[0], "self_attn", None)
+        cfg = getattr(first_attn, "config", None)
+        return str(getattr(cfg, "_attn_implementation", "")) in ("flash_attention_2", "sdpa")
+
     def _append_vertical_kv_step(
         self,
         step_hidden: torch.Tensor,
@@ -1435,7 +1705,7 @@ class Emuflashar(nn.Module):
         cache = past_key_values if past_key_values is not None else DynamicCache()
         batch_size = int(step_hidden.size(0))
         current_len = int(step_hidden.size(1))
-        if self._vertical_uses_flash_attention_2():
+        if self._vertical_uses_sdpa_or_fa2():
             attention_mask = None
         else:
             attention_mask = self._build_kv_attention_mask(
@@ -1463,6 +1733,13 @@ class Emuflashar(nn.Module):
             cache = layer_outputs[1]
         return self.vertical_norm(v_hidden), cache
 
+    def _project_visual_head(self, head: nn.Linear, hidden: torch.Tensor) -> torch.Tensor:
+        if self.visual_token_offset is not None and self.visual_token_offset > 0:
+            w = head.weight[self.visual_token_offset :]
+            b = head.bias[self.visual_token_offset :] if head.bias is not None else None
+            return F.linear(hidden, w, b)
+        return head(hidden)
+
     def _compute_step_logits_from_prev(
         self,
         cond_horizontal_hidden: torch.Tensor,
@@ -1474,43 +1751,70 @@ class Emuflashar(nn.Module):
         height: int,
         width: int,
         device: torch.device,
+        step_meta: Optional[Dict[str, object]] = None,
     ) -> torch.Tensor:
         batch_size = int(cond_horizontal_hidden.size(0))
-        cond_h_logits = self.horizontal_head(cond_horizontal_hidden)
-        cond_v_logits = self.vertical_head(cond_vertical_hidden)
+        out_vocab = (
+            self.vocab_size - int(self.visual_token_offset)
+            if (self.visual_token_offset is not None and self.visual_token_offset > 0)
+            else self.vocab_size
+        )
+        out_dtype = cond_horizontal_hidden.dtype
         step_logits = torch.empty(
-            (batch_size, step_positions.numel(), self.vocab_size),
+            (batch_size, step_positions.numel(), out_vocab),
             device=device,
-            dtype=cond_h_logits.dtype,
+            dtype=out_dtype,
         )
 
-        rows = step_positions // width
-        cols = step_positions % width
-        left_mask = cols > 0
-        up_mask = rows > 0
-        both_mask = left_mask & up_mask
-        corner_mask = ~left_mask & ~up_mask
-        h_only = left_mask & ~up_mask
-        v_only = up_mask & ~left_mask
+        if step_meta is not None:
+            has_corner = bool(step_meta["has_corner"])
+            has_h_only = bool(step_meta["has_h_only"])
+            has_v_only = bool(step_meta["has_v_only"])
+            has_both = bool(step_meta["has_both"])
+            corner_mask = step_meta["corner_mask"]
+            h_only = step_meta["h_only"]
+            v_only = step_meta["v_only"]
+            both_mask = step_meta["both_mask"]
+        else:
+            rows = step_positions // width
+            cols = step_positions % width
+            left_mask = cols > 0
+            up_mask = rows > 0
+            both_mask = left_mask & up_mask
+            corner_mask = ~left_mask & ~up_mask
+            h_only = left_mask & ~up_mask
+            v_only = up_mask & ~left_mask
+            has_corner = bool(corner_mask.any())
+            has_h_only = bool(h_only.any())
+            has_v_only = bool(v_only.any())
+            has_both = bool(both_mask.any())
 
         if prev_h_hidden is not None and prev_v_hidden is not None and prev_positions.numel() > 0:
-            h_prev = self.horizontal_head(prev_h_hidden)
-            v_prev = self.vertical_head(prev_v_hidden)
-            total = int(height * width)
-            pos_to_idx = torch.full((total,), -1, device=device, dtype=torch.long)
-            pos_to_idx[prev_positions] = torch.arange(prev_positions.numel(), device=device)
+            if getattr(self, "_fused_branches_ready", False) and self.horizontal_head.bias is None and self.vertical_head.bias is None:
+                prev_q = int(prev_h_hidden.size(1))
+                hv_in = torch.stack([prev_h_hidden, prev_v_hidden], dim=0).view(2, batch_size * prev_q, -1)
+                hv_proj = torch.bmm(hv_in, self._fused_head_weight).view(2, batch_size, prev_q, -1)
+                h_prev, v_prev = hv_proj[0], hv_proj[1]
+            else:
+                h_prev = self._project_visual_head(self.horizontal_head, prev_h_hidden)
+                v_prev = self._project_visual_head(self.vertical_head, prev_v_hidden)
 
-            if h_only.any():
-                left_idx = pos_to_idx[step_positions[h_only] - 1]
+            if step_meta is None:
+                total = int(height * width)
+                pos_to_idx = torch.full((total,), -1, device=device, dtype=torch.long)
+                pos_to_idx[prev_positions] = torch.arange(prev_positions.numel(), device=device)
+
+            if has_h_only:
+                left_idx = step_meta["h_only_left_idx"] if step_meta is not None else pos_to_idx[step_positions[h_only] - 1]
                 step_logits[:, h_only, :] = h_prev[:, left_idx, :]
 
-            if v_only.any():
-                up_idx = pos_to_idx[step_positions[v_only] - width]
+            if has_v_only:
+                up_idx = step_meta["v_only_up_idx"] if step_meta is not None else pos_to_idx[step_positions[v_only] - width]
                 step_logits[:, v_only, :] = v_prev[:, up_idx, :]
 
-            if both_mask.any():
-                left_idx = pos_to_idx[step_positions[both_mask] - 1]
-                up_idx = pos_to_idx[step_positions[both_mask] - width]
+            if has_both:
+                left_idx = step_meta["both_left_idx"] if step_meta is not None else pos_to_idx[step_positions[both_mask] - 1]
+                up_idx = step_meta["both_up_idx"] if step_meta is not None else pos_to_idx[step_positions[both_mask] - width]
                 rw = self._hv_gate_from_pair(
                     prev_h_hidden[:, left_idx, :],
                     prev_v_hidden[:, up_idx, :],
@@ -1519,19 +1823,73 @@ class Emuflashar(nn.Module):
                 step_logits[:, both_mask, :] = (
                     rw * h_prev[:, left_idx, :] + (1.0 - rw) * v_prev[:, up_idx, :]
                 )
-        elif h_only.any() or v_only.any() or both_mask.any():
+        elif has_h_only or has_v_only or has_both:
             raise RuntimeError("Previous diagonal hidden states are missing for non-corner prediction.")
 
-        if corner_mask.any():
+        if has_corner:
+            if getattr(self, "_fused_branches_ready", False) and self.horizontal_head.bias is None and self.vertical_head.bias is None:
+                c_in = torch.stack([cond_horizontal_hidden[:, :1, :], cond_vertical_hidden[:, :1, :]], dim=0).view(2, batch_size, -1)
+                c_proj = torch.bmm(c_in, self._fused_head_weight).view(2, batch_size, 1, -1)
+                cond_h_logits, cond_v_logits = c_proj[0], c_proj[1]
+            else:
+                cond_h_logits = self._project_visual_head(self.horizontal_head, cond_horizontal_hidden)
+                cond_v_logits = self._project_visual_head(self.vertical_head, cond_vertical_hidden)
             rw_corner = self._hv_gate_corner(cond_horizontal_hidden, out_dtype=cond_h_logits.dtype)
             cond_logits = (
                 rw_corner * cond_h_logits[:, :1, :]
                 + (1.0 - rw_corner) * cond_v_logits[:, :1, :]
             )
-            step_logits[:, corner_mask, :] = cond_logits.expand(
-                -1, int(corner_mask.sum().item()), -1
-            )
+            step_logits[:, corner_mask, :] = cond_logits
         return step_logits
+
+    @staticmethod
+    def _build_step_schedule(height: int, width: int, device: torch.device) -> List[Dict[str, object]]:
+        step_id_cpu = _build_step_id(height, width, torch.device("cpu"))
+        max_step = int(step_id_cpu.max().item())
+        total = int(height * width)
+        schedule: List[Dict[str, object]] = []
+        prev_positions_cpu = torch.empty((0,), dtype=torch.long)
+
+        for step in range(0, max_step + 1):
+            step_pos_cpu = (step_id_cpu == step).nonzero(as_tuple=False).view(-1)
+            if step_pos_cpu.numel() == 0:
+                continue
+            rows = step_pos_cpu // width
+            cols = step_pos_cpu % width
+            left_mask = cols > 0
+            up_mask = rows > 0
+            both_mask = left_mask & up_mask
+            corner_mask = ~left_mask & ~up_mask
+            h_only = left_mask & ~up_mask
+            v_only = up_mask & ~left_mask
+
+            meta: Dict[str, object] = {
+                "step": step,
+                "is_last": step == max_step,
+                "num_pos": int(step_pos_cpu.numel()),
+                "step_positions": step_pos_cpu.to(device=device, dtype=torch.long),
+                "has_corner": bool(corner_mask.any().item()),
+                "has_h_only": bool(h_only.any().item()),
+                "has_v_only": bool(v_only.any().item()),
+                "has_both": bool(both_mask.any().item()),
+                "corner_mask": corner_mask.to(device=device),
+                "h_only": h_only.to(device=device),
+                "v_only": v_only.to(device=device),
+                "both_mask": both_mask.to(device=device),
+            }
+            if prev_positions_cpu.numel() > 0:
+                pos_to_idx = torch.full((total,), -1, dtype=torch.long)
+                pos_to_idx[prev_positions_cpu] = torch.arange(prev_positions_cpu.numel(), dtype=torch.long)
+                if meta["has_h_only"]:
+                    meta["h_only_left_idx"] = pos_to_idx[step_pos_cpu[h_only] - 1].to(device=device)
+                if meta["has_v_only"]:
+                    meta["v_only_up_idx"] = pos_to_idx[step_pos_cpu[v_only] - width].to(device=device)
+                if meta["has_both"]:
+                    meta["both_left_idx"] = pos_to_idx[step_pos_cpu[both_mask] - 1].to(device=device)
+                    meta["both_up_idx"] = pos_to_idx[step_pos_cpu[both_mask] - width].to(device=device)
+            schedule.append(meta)
+            prev_positions_cpu = step_pos_cpu
+        return schedule
 
     def _generate_with_kv_cache(
         self,
@@ -1549,8 +1907,6 @@ class Emuflashar(nn.Module):
         top_p: float,
         sample_logits: bool,
     ) -> torch.Tensor:
-        step_id = _build_step_id(height, width, device)
-        max_step = int(step_id.max().item())
         grid = torch.full(
             (1, height, width), self.mask_token_id, device=device, dtype=torch.long
         )
@@ -1573,77 +1929,127 @@ class Emuflashar(nn.Module):
         else:
             kv_text_ids, kv_text_mask = text_input_ids, text_attention_mask
 
-        cond_horizontal_hidden, cond_vertical_hidden, backbone_cache, prefix_len, prefix_mask = self._prefill_generation_prefix(
-            kv_text_ids,
-            kv_text_mask,
-        )
+        self._init_fused_branches()
+        use_fused_hv = bool(getattr(self, "_fused_branches_ready", False)) and not self.split_backbone
+        max_rotary_len = max(2048, int(kv_text_ids.size(1)) + height * width + 64)
 
-        batch_size = int(kv_text_ids.size(0))
-        vertical_cache = DynamicCache() if self.vertical_block is not None else None
-        past_image_len = 0
-        prev_positions = torch.empty((0,), device=device, dtype=torch.long)
-        prev_h_hidden = None
-        prev_v_hidden = None
-
-        for step in range(0, max_step + 1):
-            step_positions = (step_id == step).nonzero(as_tuple=False).view(-1).to(
-                device=device, dtype=torch.long
-            )
-            if step_positions.numel() == 0:
-                continue
-
-            branch_step_logits = self._compute_step_logits_from_prev(
-                cond_horizontal_hidden=cond_horizontal_hidden,
-                cond_vertical_hidden=cond_vertical_hidden,
-                prev_h_hidden=prev_h_hidden,
-                prev_v_hidden=prev_v_hidden,
-                step_positions=step_positions,
-                prev_positions=prev_positions,
-                height=height,
-                width=width,
-                device=device,
+        with self._fast_decode_context(max_seq_len=max_rotary_len):
+            cond_horizontal_hidden, cond_vertical_hidden, backbone_cache, prefix_len, prefix_mask = self._prefill_generation_prefix(
+                kv_text_ids,
+                kv_text_mask,
             )
 
-            if use_cfg:
-                u_step_logits, c_step_logits = branch_step_logits.chunk(2, dim=0)
-                step_logits = u_step_logits + cfg_scale * (c_step_logits - u_step_logits)
-            else:
-                step_logits = branch_step_logits
+            batch_size = int(kv_text_ids.size(0))
+            vertical_cache = DynamicCache() if self.vertical_block is not None else None
+            past_image_len = 0
+            prev_positions = torch.empty((0,), device=device, dtype=torch.long)
+            prev_h_hidden = None
+            prev_v_hidden = None
 
-            if self.visual_token_offset is not None:
-                step_logits = step_logits.clone()
-                step_logits[:, :, : self.visual_token_offset] = float("-inf")
+            schedule = self._build_step_schedule(height, width, device)
+            vis_offset = int(self.visual_token_offset) if (self.visual_token_offset is not None and self.visual_token_offset > 0) else 0
 
-            step_pred = _sample_logits(
-                step_logits,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                sample_logits=sample_logits,
-            )
-            grid.view(1, -1)[:, step_positions] = step_pred
+            # Pre-allocate reusable 4D step attention mask buffer once per image
+            mask_dtype = cond_horizontal_hidden.dtype
+            max_q_len = min(height, width)
+            max_kv_len = prefix_len + height * width
+            master_attn_mask: Optional[torch.Tensor] = None
+            if not self._backbone_uses_flash_attention_2():
+                master_attn_mask = torch.zeros(
+                    (batch_size, 1, max_q_len, max_kv_len),
+                    device=device,
+                    dtype=mask_dtype,
+                )
+                if prefix_len > 0 and prefix_mask is not None:
+                    invalid_prefix = ~prefix_mask.to(device=device).bool()
+                    if bool(invalid_prefix.any().item()):
+                        master_attn_mask[:, :, :, :prefix_len] = master_attn_mask[:, :, :, :prefix_len].masked_fill(
+                            invalid_prefix[:, None, None, :],
+                            torch.finfo(mask_dtype).min,
+                        )
 
-            step_token_ids = step_pred.expand(batch_size, -1).contiguous()
-            current_h_hidden, current_v_input_hidden, backbone_cache = self._append_backbone_kv_step(
-                step_token_ids=step_token_ids,
-                step_positions=step_positions,
-                prefix_len=prefix_len,
-                prefix_attention_mask=prefix_mask,
-                past_key_values=backbone_cache,
-                past_image_len=past_image_len,
-            )
-            current_v_hidden, vertical_cache = self._append_vertical_kv_step(
-                step_hidden=current_v_input_hidden,
-                step_positions=step_positions,
-                prefix_len=prefix_len,
-                past_key_values=vertical_cache,
-                past_image_len=past_image_len,
-            )
+            for s_meta in schedule:
+                step_positions = s_meta["step_positions"]
+                q_len = int(s_meta["num_pos"])
 
-            prev_positions = step_positions
-            prev_h_hidden = current_h_hidden
-            prev_v_hidden = current_v_hidden
-            past_image_len += int(step_positions.numel())
+                branch_step_logits = self._compute_step_logits_from_prev(
+                    cond_horizontal_hidden=cond_horizontal_hidden,
+                    cond_vertical_hidden=cond_vertical_hidden,
+                    prev_h_hidden=prev_h_hidden,
+                    prev_v_hidden=prev_v_hidden,
+                    step_positions=step_positions,
+                    prev_positions=prev_positions,
+                    height=height,
+                    width=width,
+                    device=device,
+                    step_meta=s_meta,
+                )
+
+                if use_cfg:
+                    u_step_logits, c_step_logits = branch_step_logits.chunk(2, dim=0)
+                    step_logits = u_step_logits + cfg_scale * (c_step_logits - u_step_logits)
+                else:
+                    step_logits = branch_step_logits
+
+                step_pred = _sample_logits(
+                    step_logits,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    sample_logits=sample_logits,
+                )
+                if vis_offset > 0:
+                    step_pred = step_pred + vis_offset
+                grid.view(1, -1)[:, step_positions] = step_pred
+
+                if bool(s_meta["is_last"]):
+                    break
+
+                step_token_ids = step_pred.expand(batch_size, -1).contiguous()
+                if use_fused_hv and master_attn_mask is not None:
+                    total_kv = prefix_len + past_image_len + q_len
+                    step_attn_mask = master_attn_mask[:, :, :q_len, :total_kv].contiguous()
+                    position_ids = (step_positions + int(prefix_len)).unsqueeze(0).expand(batch_size, -1)
+                    shared_outputs = self.backbone(
+                        input_ids=step_token_ids,
+                        attention_mask=step_attn_mask,
+                        position_ids=position_ids,
+                        past_key_values=backbone_cache,
+                        use_cache=True,
+                        return_dict=True,
+                        stop_after_layer=self.vertical_start_layer,
+                    )
+                    backbone_cache = shared_outputs.past_key_values
+                    current_h_hidden, current_v_hidden = self._forward_fused_branches(
+                        shared_hidden=shared_outputs.last_hidden_state,
+                        step_positions=step_positions,
+                        prefix_len=prefix_len,
+                        step_attn_mask=step_attn_mask,
+                        backbone_cache=backbone_cache,
+                        vertical_cache=vertical_cache,
+                        max_seq_len=max_rotary_len,
+                    )
+                else:
+                    current_h_hidden, current_v_input_hidden, backbone_cache = self._append_backbone_kv_step(
+                        step_token_ids=step_token_ids,
+                        step_positions=step_positions,
+                        prefix_len=prefix_len,
+                        prefix_attention_mask=prefix_mask,
+                        past_key_values=backbone_cache,
+                        past_image_len=past_image_len,
+                    )
+                    current_v_hidden, vertical_cache = self._append_vertical_kv_step(
+                        step_hidden=current_v_input_hidden,
+                        step_positions=step_positions,
+                        prefix_len=prefix_len,
+                        past_key_values=vertical_cache,
+                        past_image_len=past_image_len,
+                    )
+
+                prev_positions = step_positions
+                prev_h_hidden = current_h_hidden
+                prev_v_hidden = current_v_hidden
+                past_image_len += q_len
         return grid[0]
 
     # ------------------------------------------------------------------

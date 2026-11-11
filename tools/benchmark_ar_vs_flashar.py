@@ -13,11 +13,20 @@ from typing import Any, Dict
 
 import torch
 from transformers import GenerationConfig
-from transformers.generation import LogitsProcessorList
+from transformers.generation import GenerationMixin, LogitsProcessorList
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.emu3p5.modeling_emu3 import Emu3ForCausalLM, Emu3PreTrainedModel
+from transformers.cache_utils import DynamicCache
+if not issubclass(Emu3ForCausalLM, GenerationMixin):
+    Emu3ForCausalLM.__bases__ = (Emu3PreTrainedModel, GenerationMixin)
+if not hasattr(DynamicCache, "seen_tokens"):
+    DynamicCache.seen_tokens = property(lambda self: self.get_seq_length())
+if not hasattr(DynamicCache, "get_max_length"):
+    DynamicCache.get_max_length = lambda self: None
 
 from src.utils.benchmark_utils import (
     build_prompt_tensor,
@@ -140,6 +149,21 @@ def _run_flashar_t2i(
     _log_stage(
         f"flashar: prompt_len={prompt_ids.shape[1]} diag_steps={diag_steps} size={cfg.target_height}x{cfg.target_width} cfg={cfg.classifier_free_guidance}"
     )
+
+    _log_stage("flashar: warming up CUDA kernels")
+    _ = flashar_wrapper.generate(
+        height=int(cfg.target_height),
+        width=int(cfg.target_width),
+        device=device,
+        text_input_ids=prompt_ids,
+        unconditional_text_input_ids=uncond_prompt_ids,
+        cfg_scale=float(cfg.classifier_free_guidance),
+        temperature=float(cfg.sampling_params.get("image_temperature", 1.0)),
+        top_k=int(cfg.sampling_params.get("image_top_k", 0)),
+        top_p=float(cfg.sampling_params.get("image_top_p", 1.0)),
+        sample_logits=bool(cfg.sampling_params.get("do_sample", True)),
+    )
+    sync_cuda()
 
     _log_stage("flashar: starting wrapper.generate()")
     infer_start = time.perf_counter()
@@ -311,6 +335,12 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Output directory. Defaults to outputs/bench_ar_vs_flashar/<timestamp>.",
     )
+    parser.add_argument(
+        "--modes",
+        type=str,
+        default="ar,flashar",
+        help="Comma-separated modes to run (default: ar,flashar).",
+    )
     return parser.parse_args()
 
 
@@ -323,8 +353,11 @@ def main() -> None:
         out_root = osp.abspath(osp.join("outputs", "bench_ar_vs_flashar", stamp))
     os.makedirs(out_root, exist_ok=True)
 
+    selected_modes = [m.strip() for m in args.modes.split(",") if m.strip()]
     summaries = []
     for mode_name, cfg_path in (("ar", args.ar_cfg), ("flashar", args.flashar_cfg)):
+        if mode_name not in selected_modes:
+            continue
         print(f"[INFO] running {mode_name} benchmark with {cfg_path}", flush=True)
         metrics = _run_single_mode(mode_name, cfg_path, out_root)
         summaries.append(metrics)
