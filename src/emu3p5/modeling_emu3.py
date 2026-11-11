@@ -440,9 +440,7 @@ class Emu3Attention(nn.Module):
             kv_seq_len += _get_usable_cache_length(past_key_value, kv_seq_len, self.layer_idx)
             rotary_seq_len = kv_seq_len
         if position_ids is not None:
-            # Allow callers to pass offset position ids (e.g. image-only sub-sequences
-            # that should stay aligned with the original full-sequence positions).
-            rotary_seq_len = max(rotary_seq_len, int(position_ids.max().item()) + 1)
+            rotary_seq_len = max(rotary_seq_len, int(getattr(self.rotary_emb, "max_seq_len_cached", 32768)))
         cos, sin = self.rotary_emb(value_states, seq_len=rotary_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
@@ -552,7 +550,7 @@ class Emu3FlashAttention2(Emu3Attention):
             kv_seq_len += _get_usable_cache_length(past_key_value, kv_seq_len, self.layer_idx)
             rotary_seq_len = kv_seq_len
         if position_ids is not None:
-            rotary_seq_len = max(rotary_seq_len, int(position_ids.max().item()) + 1)
+            rotary_seq_len = max(rotary_seq_len, int(getattr(self.rotary_emb, "max_seq_len_cached", 32768)))
         cos, sin = self.rotary_emb(value_states, seq_len=rotary_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
@@ -750,7 +748,7 @@ class Emu3SdpaAttention(Emu3Attention):
             kv_seq_len += _get_usable_cache_length(past_key_value, kv_seq_len, self.layer_idx)
             rotary_seq_len = kv_seq_len
         if position_ids is not None:
-            rotary_seq_len = max(rotary_seq_len, int(position_ids.max().item()) + 1)
+            rotary_seq_len = max(rotary_seq_len, int(getattr(self.rotary_emb, "max_seq_len_cached", 32768)))
         cos, sin = self.rotary_emb(value_states, seq_len=rotary_seq_len)
 
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
@@ -857,7 +855,7 @@ class Emu3FlexAttention(Emu3Attention):
         kv_seq_len = key_states.shape[-2]
         rotary_seq_len = kv_seq_len
         if position_ids is not None:
-            rotary_seq_len = max(rotary_seq_len, int(position_ids.max().item()) + 1)
+            rotary_seq_len = max(rotary_seq_len, int(getattr(self.rotary_emb, "max_seq_len_cached", 32768)))
         cos, sin = self.rotary_emb(value_states, seq_len=rotary_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 

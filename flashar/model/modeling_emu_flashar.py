@@ -1431,71 +1431,6 @@ class Emuflashar(nn.Module):
             )
         return current_h_hidden, current_v_input_hidden, outputs.past_key_values
 
-    @contextmanager
-    def _fast_decode_context(self, max_seq_len: int = 2048):
-        all_layers = list(getattr(self.backbone, "layers", []))
-        if self.vertical_block is not None:
-            all_layers.extend(list(self.vertical_block))
-        saved_forwards = []
-        from src.emu3p5.modeling_emu3 import apply_rotary_pos_emb, repeat_kv
-        dummy = next(self.backbone.parameters())[:1, :1]
-        for layer in all_layers:
-            self_attn = getattr(layer, "self_attn", None)
-            if self_attn is None or not hasattr(self_attn, "rotary_emb"):
-                continue
-            self_attn.rotary_emb(dummy, seq_len=max_seq_len)
-            orig_fwd = self_attn.forward
-            saved_forwards.append((self_attn, orig_fwd))
-
-            def _make_fast_fwd(attn_mod):
-                def _fast_fwd(
-                    hidden_states: torch.Tensor,
-                    attention_mask: Optional[torch.Tensor] = None,
-                    position_ids: Optional[torch.LongTensor] = None,
-                    past_key_value: Optional[DynamicCache] = None,
-                    output_attentions: bool = False,
-                    use_cache: bool = False,
-                    **kwargs,
-                ):
-                    bsz, q_len, _ = hidden_states.size()
-                    query_states = attn_mod.q_proj(hidden_states)
-                    key_states = attn_mod.k_proj(hidden_states)
-                    value_states = attn_mod.v_proj(hidden_states)
-
-                    query_states = attn_mod.q_norm(query_states.view(bsz, q_len, attn_mod.num_heads, attn_mod.head_dim)).transpose(1, 2)
-                    key_states = attn_mod.k_norm(key_states.view(bsz, q_len, attn_mod.num_key_value_heads, attn_mod.head_dim)).transpose(1, 2)
-                    value_states = value_states.view(bsz, q_len, attn_mod.num_key_value_heads, attn_mod.head_dim).transpose(1, 2)
-
-                    cos, sin = attn_mod.rotary_emb(value_states, seq_len=max_seq_len)
-                    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-
-                    if past_key_value is not None:
-                        key_states, value_states = past_key_value.update(key_states, value_states, attn_mod.layer_idx)
-
-                    key_states = repeat_kv(key_states, attn_mod.num_key_value_groups)
-                    value_states = repeat_kv(value_states, attn_mod.num_key_value_groups)
-
-                    attn_output = F.scaled_dot_product_attention(
-                        query_states,
-                        key_states,
-                        value_states,
-                        attn_mask=attention_mask,
-                        dropout_p=0.0,
-                        is_causal=bool(getattr(attn_mod, "is_causal", False)) and attention_mask is None and q_len > 1,
-                    )
-                    attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
-                    attn_output = attn_mod.o_proj(attn_output)
-                    return attn_output, None, past_key_value
-
-                return _fast_fwd
-
-            self_attn.forward = _make_fast_fwd(self_attn)
-        try:
-            yield
-        finally:
-            for self_attn, orig_fwd in saved_forwards:
-                self_attn.forward = orig_fwd
-
     def _init_fused_branches(self) -> None:
         if getattr(self, "_fused_branches_ready", False):
             return
@@ -1898,83 +1833,83 @@ class Emuflashar(nn.Module):
         use_fused_hv = bool(getattr(self, "_fused_branches_ready", False)) and not self.split_backbone
         max_rotary_len = max(2048, int(kv_text_ids.size(1)) + height * width + 64)
 
-        with self._fast_decode_context(max_seq_len=max_rotary_len):
-            cond_horizontal_hidden, cond_vertical_hidden, backbone_cache, prefix_len, prefix_mask = self._prefill_generation_prefix(
-                kv_text_ids,
-                kv_text_mask,
+        cond_horizontal_hidden, cond_vertical_hidden, backbone_cache, prefix_len, prefix_mask = self._prefill_generation_prefix(
+            kv_text_ids,
+            kv_text_mask,
+        )
+
+        batch_size = int(kv_text_ids.size(0))
+        vertical_cache = DynamicCache() if self.vertical_block is not None else None
+        past_image_len = 0
+        prev_positions = torch.empty((0,), device=device, dtype=torch.long)
+        prev_h_hidden = None
+        prev_v_hidden = None
+
+        schedule = self._build_step_schedule(height, width, device)
+        vis_offset = int(self.visual_token_offset) if (self.visual_token_offset is not None and self.visual_token_offset > 0) else 0
+
+        # Pre-allocate reusable 4D step attention mask buffer once per image
+        mask_dtype = cond_horizontal_hidden.dtype
+        max_q_len = min(height, width)
+        max_kv_len = prefix_len + height * width
+        master_attn_mask: Optional[torch.Tensor] = None
+        if not self._backbone_uses_flash_attention_2():
+            master_attn_mask = torch.zeros(
+                (batch_size, 1, max_q_len, max_kv_len),
+                device=device,
+                dtype=mask_dtype,
+            )
+            if prefix_len > 0 and prefix_mask is not None:
+                invalid_prefix = ~prefix_mask.to(device=device).bool()
+                if bool(invalid_prefix.any().item()):
+                    master_attn_mask[:, :, :, :prefix_len] = master_attn_mask[:, :, :, :prefix_len].masked_fill(
+                        invalid_prefix[:, None, None, :],
+                        torch.finfo(mask_dtype).min,
+                    )
+
+        for s_meta in schedule:
+            step_positions = s_meta["step_positions"]
+            q_len = int(s_meta["num_pos"])
+
+            branch_step_logits = self._compute_step_logits_from_prev(
+                cond_horizontal_hidden=cond_horizontal_hidden,
+                cond_vertical_hidden=cond_vertical_hidden,
+                prev_h_hidden=prev_h_hidden,
+                prev_v_hidden=prev_v_hidden,
+                step_positions=step_positions,
+                prev_positions=prev_positions,
+                height=height,
+                width=width,
+                device=device,
+                step_meta=s_meta,
             )
 
-            batch_size = int(kv_text_ids.size(0))
-            vertical_cache = DynamicCache() if self.vertical_block is not None else None
-            past_image_len = 0
-            prev_positions = torch.empty((0,), device=device, dtype=torch.long)
-            prev_h_hidden = None
-            prev_v_hidden = None
+            if use_cfg:
+                u_step_logits, c_step_logits = branch_step_logits.chunk(2, dim=0)
+                step_logits = u_step_logits + cfg_scale * (c_step_logits - u_step_logits)
+            else:
+                step_logits = branch_step_logits
 
-            schedule = self._build_step_schedule(height, width, device)
-            vis_offset = int(self.visual_token_offset) if (self.visual_token_offset is not None and self.visual_token_offset > 0) else 0
+            step_pred = _sample_logits(
+                step_logits,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                sample_logits=sample_logits,
+            )
+            if vis_offset > 0:
+                step_pred = step_pred + vis_offset
+            grid.view(1, -1)[:, step_positions] = step_pred
 
-            # Pre-allocate reusable 4D step attention mask buffer once per image
-            mask_dtype = cond_horizontal_hidden.dtype
-            max_q_len = min(height, width)
-            max_kv_len = prefix_len + height * width
-            master_attn_mask: Optional[torch.Tensor] = None
-            if not self._backbone_uses_flash_attention_2():
-                master_attn_mask = torch.zeros(
-                    (batch_size, 1, max_q_len, max_kv_len),
-                    device=device,
-                    dtype=mask_dtype,
-                )
-                if prefix_len > 0 and prefix_mask is not None:
-                    invalid_prefix = ~prefix_mask.to(device=device).bool()
-                    if bool(invalid_prefix.any().item()):
-                        master_attn_mask[:, :, :, :prefix_len] = master_attn_mask[:, :, :, :prefix_len].masked_fill(
-                            invalid_prefix[:, None, None, :],
-                            torch.finfo(mask_dtype).min,
-                        )
+            if bool(s_meta["is_last"]):
+                break
 
-            for s_meta in schedule:
-                step_positions = s_meta["step_positions"]
-                q_len = int(s_meta["num_pos"])
-
-                branch_step_logits = self._compute_step_logits_from_prev(
-                    cond_horizontal_hidden=cond_horizontal_hidden,
-                    cond_vertical_hidden=cond_vertical_hidden,
-                    prev_h_hidden=prev_h_hidden,
-                    prev_v_hidden=prev_v_hidden,
-                    step_positions=step_positions,
-                    prev_positions=prev_positions,
-                    height=height,
-                    width=width,
-                    device=device,
-                    step_meta=s_meta,
-                )
-
-                if use_cfg:
-                    u_step_logits, c_step_logits = branch_step_logits.chunk(2, dim=0)
-                    step_logits = u_step_logits + cfg_scale * (c_step_logits - u_step_logits)
-                else:
-                    step_logits = branch_step_logits
-
-                step_pred = _sample_logits(
-                    step_logits,
-                    temperature=temperature,
-                    top_k=top_k,
-                    top_p=top_p,
-                    sample_logits=sample_logits,
-                )
-                if vis_offset > 0:
-                    step_pred = step_pred + vis_offset
-                grid.view(1, -1)[:, step_positions] = step_pred
-
-                if bool(s_meta["is_last"]):
-                    break
-
-                step_token_ids = step_pred.expand(batch_size, -1).contiguous()
-                if use_fused_hv and master_attn_mask is not None:
-                    total_kv = prefix_len + past_image_len + q_len
-                    step_attn_mask = master_attn_mask[:, :, :q_len, :total_kv].contiguous()
-                    position_ids = (step_positions + int(prefix_len)).unsqueeze(0).expand(batch_size, -1)
+            step_token_ids = step_pred.expand(batch_size, -1).contiguous()
+            if use_fused_hv and master_attn_mask is not None:
+                total_kv = prefix_len + past_image_len + q_len
+                step_attn_mask = master_attn_mask[:, :, :q_len, :total_kv].contiguous()
+                position_ids = (step_positions + int(prefix_len)).unsqueeze(0).expand(batch_size, -1)
+                with self._temporary_backbone_non_causal():
                     shared_outputs = self.backbone(
                         input_ids=step_token_ids,
                         attention_mask=step_attn_mask,
@@ -1984,37 +1919,37 @@ class Emuflashar(nn.Module):
                         return_dict=True,
                         stop_after_layer=self.vertical_start_layer,
                     )
-                    backbone_cache = shared_outputs.past_key_values
-                    current_h_hidden, current_v_hidden = self._forward_fused_branches(
-                        shared_hidden=shared_outputs.last_hidden_state,
-                        step_positions=step_positions,
-                        prefix_len=prefix_len,
-                        step_attn_mask=step_attn_mask,
-                        backbone_cache=backbone_cache,
-                        vertical_cache=vertical_cache,
-                        max_seq_len=max_rotary_len,
-                    )
-                else:
-                    current_h_hidden, current_v_input_hidden, backbone_cache = self._append_backbone_kv_step(
-                        step_token_ids=step_token_ids,
-                        step_positions=step_positions,
-                        prefix_len=prefix_len,
-                        prefix_attention_mask=prefix_mask,
-                        past_key_values=backbone_cache,
-                        past_image_len=past_image_len,
-                    )
-                    current_v_hidden, vertical_cache = self._append_vertical_kv_step(
-                        step_hidden=current_v_input_hidden,
-                        step_positions=step_positions,
-                        prefix_len=prefix_len,
-                        past_key_values=vertical_cache,
-                        past_image_len=past_image_len,
-                    )
+                backbone_cache = shared_outputs.past_key_values
+                current_h_hidden, current_v_hidden = self._forward_fused_branches(
+                    shared_hidden=shared_outputs.last_hidden_state,
+                    step_positions=step_positions,
+                    prefix_len=prefix_len,
+                    step_attn_mask=step_attn_mask,
+                    backbone_cache=backbone_cache,
+                    vertical_cache=vertical_cache,
+                    max_seq_len=max_rotary_len,
+                )
+            else:
+                current_h_hidden, current_v_input_hidden, backbone_cache = self._append_backbone_kv_step(
+                    step_token_ids=step_token_ids,
+                    step_positions=step_positions,
+                    prefix_len=prefix_len,
+                    prefix_attention_mask=prefix_mask,
+                    past_key_values=backbone_cache,
+                    past_image_len=past_image_len,
+                )
+                current_v_hidden, vertical_cache = self._append_vertical_kv_step(
+                    step_hidden=current_v_input_hidden,
+                    step_positions=step_positions,
+                    prefix_len=prefix_len,
+                    past_key_values=vertical_cache,
+                    past_image_len=past_image_len,
+                )
 
-                prev_positions = step_positions
-                prev_h_hidden = current_h_hidden
-                prev_v_hidden = current_v_hidden
-                past_image_len += q_len
+            prev_positions = step_positions
+            prev_h_hidden = current_h_hidden
+            prev_v_hidden = current_v_hidden
+            past_image_len += q_len
         return grid[0]
 
     # ------------------------------------------------------------------
