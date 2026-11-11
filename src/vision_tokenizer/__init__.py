@@ -20,15 +20,24 @@ def build_vision_tokenizer(
             if osp.exists(model_path):
                 cfg_path = osp.join(model_path, config_file)
                 ckpt_path = osp.join(model_path, ckpt_file)
-                if not (osp.exists(cfg_path) and osp.exists(ckpt_path)):
+                safetensors_path = osp.join(model_path, "model.safetensors")
+                if not osp.exists(cfg_path):
                     raise FileNotFoundError(
-                        f"config/ckpt not found under {model_path}: expected {config_file}, {ckpt_file}"
+                        f"config not found under {model_path}: expected {config_file}"
                     )
                 cfg = OmegaConf.load(cfg_path)
                 tokenizer = IBQ(**cfg)
-                ckpt = torch.load(ckpt_path, map_location="cpu")
-                if isinstance(ckpt, dict) and "state_dict" in ckpt:
-                    ckpt = ckpt["state_dict"]
+                if osp.exists(ckpt_path):
+                    ckpt = torch.load(ckpt_path, map_location="cpu")
+                    if isinstance(ckpt, dict) and "state_dict" in ckpt:
+                        ckpt = ckpt["state_dict"]
+                elif osp.exists(safetensors_path):
+                    from safetensors.torch import load_file
+                    ckpt = load_file(safetensors_path)
+                else:
+                    raise FileNotFoundError(
+                        f"ckpt not found under {model_path}: expected {ckpt_file} or model.safetensors"
+                    )
                 tokenizer.load_state_dict(ckpt)
                 tokenizer.eval().to(device)
                 return tokenizer

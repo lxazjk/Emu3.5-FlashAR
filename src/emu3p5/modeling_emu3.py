@@ -740,8 +740,8 @@ class Emu3SdpaAttention(Emu3Attention):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        query_states = self.q_norm(query_states.view(bsz, q_len, self.num_heads, self.head_dim)).transpose(1, 2)
+        key_states = self.k_norm(key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
@@ -786,7 +786,7 @@ class Emu3SdpaAttention(Emu3Attention):
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
 
         attn_output = self.o_proj(attn_output)
 
@@ -1193,9 +1193,9 @@ class Emu3Model(Emu3PreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if attention_mask is not None and attention_mask.dim() == 4:
-            # User-provided 4D mask (e.g. Neighbor-AR step mask). This requires eager attention.
-            if self._use_flash_attention_2 or self._use_sdpa:
-                raise ValueError("4D attention_mask requires attn_implementation='eager'.")
+            # Eager and SDPA both accept an explicit additive attention mask.
+            if self._use_flash_attention_2:
+                raise ValueError("4D attention_mask requires eager or sdpa attention.")
             # Use the mask as-is: shape [batch, 1, seq, seq].
             attention_mask = attention_mask
         elif self._use_flash_attention_2:

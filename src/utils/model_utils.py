@@ -109,7 +109,7 @@ def build_emu3p5_flashar_inference(
     flashar_use_vertical_block=None,
     flashar_vertical_layers=0,
     flashar_vertical_start_layer=-1,
-    flashar_attn_implementation="eager",
+    flashar_attn_implementation="sdpa",
     flashar_merge_dtype="bf16",
     flashar_fsdp_wrap_policy="transformer",
     flashar_fsdp_min_params=1_000_000,
@@ -123,6 +123,52 @@ def build_emu3p5_flashar_inference(
         device_map = model_device
 
     print(device_map)
+    if not flashar_ckpt_path or not osp.exists(str(flashar_ckpt_path)):
+        print(
+            f"[flashar-LOAD] flashar_ckpt_path={flashar_ckpt_path!r} not found; initializing FlashAR wrapper directly from {model_path}",
+            flush=True,
+        )
+        if device_map == "auto":
+            target_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        else:
+            target_device = torch.device(device_map)
+        model_config = Emu3Config.from_pretrained(model_path, trust_remote_code=True)
+        model_config._attn_implementation = flashar_attn_implementation
+        base_lm = Emu3ForCausalLM.from_pretrained(
+            model_path,
+            config=model_config,
+            torch_dtype=torch.bfloat16,
+            attn_implementation=flashar_attn_implementation,
+            low_cpu_mem_usage=True,
+            device_map={"": str(target_device)},
+        ).eval()
+        for layer in base_lm.model.layers:
+            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "is_causal"):
+                layer.self_attn.is_causal = False
+        use_vertical_block = True if flashar_use_vertical_block is None else bool(flashar_use_vertical_block)
+        vertical_layers = int(flashar_vertical_layers) if int(flashar_vertical_layers) > 0 else 4
+        vertical_start_layer = (
+            int(flashar_vertical_start_layer)
+            if int(flashar_vertical_start_layer) >= 0
+            else int(model_config.num_hidden_layers) - vertical_layers
+        )
+        wrapper = Emuflashar(
+            pretrained_backbone=base_lm.model,
+            vocab_size=model_config.vocab_size,
+            hidden_size=model_config.hidden_size,
+            pad_token_id=-100,
+            mask_token_id=model_config.pad_token_id,
+            visual_token_offset=int(model_config.eoi_token_id) + 1,
+            use_vertical_block=use_vertical_block,
+            vertical_layers=vertical_layers if use_vertical_block else 0,
+            vertical_start_layer=vertical_start_layer,
+            lm_head=base_lm.lm_head,
+            split_backbone=bool(flashar_split_backbone),
+        ).to(device=target_device, dtype=torch.bfloat16).eval()
+        tokenizer = _build_text_tokenizer(tokenizer_path)
+        vq_model = build_vision_tokenizer(vq_type, vq_path, device=vq_device, **kwargs)
+        return wrapper, tokenizer, vq_model, str(model_path)
+
     print("[flashar-LOAD] resolving checkpoint path", flush=True)
     resolved_ckpt_path = _resolve_flashar_ckpt_path(
         flashar_ckpt_path=flashar_ckpt_path,
