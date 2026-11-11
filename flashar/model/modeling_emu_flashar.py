@@ -1458,16 +1458,9 @@ class Emuflashar(nn.Module):
                     **kwargs,
                 ):
                     bsz, q_len, _ = hidden_states.size()
-                    qkv_w = getattr(attn_mod, "_fused_qkv_weight", None)
-                    if qkv_w is not None:
-                        q_sz = attn_mod.num_heads * attn_mod.head_dim
-                        kv_sz = attn_mod.num_key_value_heads * attn_mod.head_dim
-                        qkv = F.linear(hidden_states, qkv_w)
-                        query_states, key_states, value_states = torch.split(qkv, [q_sz, kv_sz, kv_sz], dim=-1)
-                    else:
-                        query_states = attn_mod.q_proj(hidden_states)
-                        key_states = attn_mod.k_proj(hidden_states)
-                        value_states = attn_mod.v_proj(hidden_states)
+                    query_states = attn_mod.q_proj(hidden_states)
+                    key_states = attn_mod.k_proj(hidden_states)
+                    value_states = attn_mod.v_proj(hidden_states)
 
                     query_states = attn_mod.q_norm(query_states.view(bsz, q_len, attn_mod.num_heads, attn_mod.head_dim)).transpose(1, 2)
                     key_states = attn_mod.k_norm(key_states.view(bsz, q_len, attn_mod.num_key_value_heads, attn_mod.head_dim)).transpose(1, 2)
@@ -1571,34 +1564,6 @@ class Emuflashar(nn.Module):
             [self.backbone.norm.weight, self.vertical_norm.weight], dim=0
         ).view(2, 1, 1, -1).contiguous()
         self._fused_final_norm_eps = float(self.backbone.norm.variance_epsilon)
-
-        # Also fuse QKV and Gate+Up in-place across shared backbone layers to reduce GEMM launches
-        for s_layer in self.backbone.layers[: self.vertical_start_layer]:
-            sa = s_layer.self_attn
-            if getattr(sa, "_fused_qkv_weight", None) is None and sa.q_proj is not None:
-                sa._fused_qkv_weight = torch.cat(
-                    [sa.q_proj.weight, sa.k_proj.weight, sa.v_proj.weight], dim=0
-                ).contiguous()
-                sa.q_proj = None
-                sa.k_proj = None
-                sa.v_proj = None
-            sm = s_layer.mlp
-            if getattr(sm, "_fused_gu_weight", None) is None and sm.gate_proj is not None:
-                sm._fused_gu_weight = torch.cat(
-                    [sm.gate_proj.weight, sm.up_proj.weight], dim=0
-                ).contiguous()
-                sm.gate_proj = None
-                sm.up_proj = None
-
-                def _make_fast_mlp_fwd(mlp_mod):
-                    def _fast_mlp_fwd(x: torch.Tensor) -> torch.Tensor:
-                        gate, up = F.linear(x, mlp_mod._fused_gu_weight).chunk(2, dim=-1)
-                        return mlp_mod.down_proj(mlp_mod.act_fn(gate) * up)
-
-                    return _fast_mlp_fwd
-
-                sm.forward = _make_fast_mlp_fwd(sm)
-
         self._fused_branches_ready = True
 
     @staticmethod
